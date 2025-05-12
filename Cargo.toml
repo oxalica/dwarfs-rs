@@ -1,0 +1,8 @@
+[package]
+name = "dwarfs"
+version = "0.0.0"
+edition = "2024"
+description = "WIP"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
