@@ -83,9 +83,8 @@ impl<'a> Decoder<'a> {
         Ok(Some((*field_id, tag)))
     }
 
-    fn decode_map_int_struct<K, V, F>(&mut self, mut de_value: F) -> Result<Vec<(K, V)>>
+    fn decode_map_int_struct<V, F>(&mut self, mut de_value: F) -> Result<Vec<Option<V>>>
     where
-        K: TryFrom<i64> + std::fmt::Debug,
         F: FnMut(&mut Self) -> Result<V>,
     {
         let size = self.decode_uint::<usize>()?;
@@ -100,11 +99,15 @@ impl<'a> Decoder<'a> {
             return Err(Error::UnexpectedType);
         };
 
-        let mut elems = Vec::with_capacity(size.min(self.rest.len()));
+        let cap = self.rest.len() + 1;
+        let mut elems = Vec::with_capacity(size.min(cap));
         for _ in 0..size {
-            let k = self.decode_sint()?;
+            let k = self.decode_sint::<usize>()?;
             let v = de_value(self)?;
-            elems.push((k, v));
+            if k >= elems.len() {
+                elems.resize_with(k + 1, || None);
+            }
+            elems[k] = Some(v);
         }
         Ok(elems)
     }
@@ -144,33 +147,66 @@ impl Tag {
 pub struct Schema {
     pub file_version: i32,
     pub relax_type_checks: bool,
-    pub layouts: Vec<(i16, SchemaLayout)>,
-    pub root_layout: i16,
+    pub layouts: Vec<Option<SchemaLayout>>,
+    pub root_layout: u16,
+}
+
+impl Schema {
+    pub fn get_layout(&self, idx: u16) -> Option<&SchemaLayout> {
+        self.layouts.get(usize::from(idx))?.as_ref()
+    }
 }
 
 #[derive(Debug)]
 pub struct SchemaLayout {
-    pub size: i32,
-    pub bits: i16,
-    pub fields: Vec<(i16, SchemaField)>,
+    pub size: u32,
+    pub bits: u16,
+    pub fields: Vec<Option<SchemaField>>,
     pub type_name: String,
 }
 
-#[derive(Debug)]
+impl SchemaLayout {
+    pub fn get_field(&self, idx: u16) -> Option<SchemaField> {
+        *self.fields.get(usize::from(idx))?
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct SchemaField {
-    pub layout_id: i16,
+    pub layout_id: u16,
     pub offset: i16,
 }
 
+impl SchemaField {
+    pub fn offset_bits(self) -> u64 {
+        let o = self.offset;
+        if o >= 0 { o as u64 * 8 } else { -o as u64 }
+    }
+}
+
+/// Parse and validate field ranges.
+///
 /// <https://github.com/facebook/fbthrift/blob/4375e4b08135d06fd56399b86ef93f3e6d43017c/thrift/lib/thrift/frozen.thrift#L42-L51>
 pub fn parse_schema(src: &[u8]) -> Result<Schema> {
     const FILE_VERSION: i32 = 1;
 
     let mut de = Decoder { rest: src };
     let schema = de_schema(&mut de)?;
-    if schema.file_version != FILE_VERSION || !schema.relax_type_checks {
+
+    if schema.file_version != FILE_VERSION
+        || !schema.relax_type_checks
+        || schema.get_layout(schema.root_layout).is_none()
+    {
         return Err(Error::InvalidVersion);
     }
+    for layout in schema.layouts.iter().flatten() {
+        for field in layout.fields.iter().flatten() {
+            if schema.get_layout(field.layout_id).is_none() {
+                return Err(Error::InvalidVersion);
+            }
+        }
+    }
+
     Ok(schema)
 }
 
@@ -203,9 +239,9 @@ fn de_schema(de: &mut Decoder) -> Result<Schema> {
 }
 
 fn de_layout(de: &mut Decoder) -> Result<SchemaLayout> {
-    let mut id = 0i16;
-    let mut size = 0i32;
-    let mut bits = 0i16;
+    let mut id = 0;
+    let mut size = 0;
+    let mut bits = 0;
     let mut fields = None;
     let mut type_name = None;
     while let Some((id, tag)) = de.decode_field_header(&mut id)? {
@@ -227,9 +263,9 @@ fn de_layout(de: &mut Decoder) -> Result<SchemaLayout> {
 }
 
 fn de_field(de: &mut Decoder) -> Result<SchemaField> {
-    let mut id = 0i16;
+    let mut id = 0;
     let mut layout_id = None;
-    let mut offset = 0i16;
+    let mut offset = 0;
     while let Some((id, tag)) = de.decode_field_header(&mut id)? {
         match (id, tag) {
             (1, Tag::Int) => layout_id = Some(de.decode_sint()?),
