@@ -6,3 +6,9 @@ description = "WIP"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+sha2 = "0.10.9"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+zerocopy = { version = "0.8.25", features = ["derive", "std"] }
+
+[lints.clippy]
+dbg-macro = "warn"
