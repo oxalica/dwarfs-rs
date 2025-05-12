@@ -1,6 +1,8 @@
 //! Mini thrift decoder, with fbthrift flavor.
 //!
 //! <https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md>
+use std::fmt;
+
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
@@ -143,12 +145,37 @@ impl Tag {
     }
 }
 
-#[derive(Debug)]
 pub struct Schema {
     pub file_version: i32,
     pub relax_type_checks: bool,
     pub layouts: Vec<Option<SchemaLayout>>,
     pub root_layout: u16,
+}
+
+struct DebugVecMap<'a, T>(&'a Vec<Option<T>>);
+
+impl<'a, T: fmt::Debug> fmt::Debug for DebugVecMap<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, elem)| Some((idx, elem.as_ref()?))),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for Schema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Schema")
+            .field("file_version", &self.file_version)
+            .field("relax_type_checks", &self.relax_type_checks)
+            .field("layouts", &DebugVecMap(&self.layouts))
+            .field("root_layout", &self.root_layout)
+            .finish()
+    }
 }
 
 impl Schema {
@@ -157,12 +184,22 @@ impl Schema {
     }
 }
 
-#[derive(Debug)]
 pub struct SchemaLayout {
     pub size: u32,
     pub bits: u16,
     pub fields: Vec<Option<SchemaField>>,
     pub type_name: String,
+}
+
+impl fmt::Debug for SchemaLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchemaLayout")
+            .field("size", &self.size)
+            .field("bits", &self.bits)
+            .field("fields", &DebugVecMap(&self.fields))
+            .field("type_name", &self.type_name)
+            .finish()
+    }
 }
 
 impl SchemaLayout {

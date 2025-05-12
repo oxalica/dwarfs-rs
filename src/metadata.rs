@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{fmt, marker::PhantomData};
 
 use self::sealed::FieldType;
 use crate::{
@@ -8,8 +8,13 @@ use crate::{
 
 mod schema;
 
-#[derive(Debug)]
 pub struct Schema(schema::Schema);
+
+impl fmt::Debug for Schema {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 impl Schema {
     pub fn parse(src: &[u8]) -> Result<Self> {
@@ -23,11 +28,19 @@ impl Schema {
     }
 }
 
-// FIXME: Do not print the whole bytes in Debug.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct RawMetadata<'m> {
     schema: &'m Schema,
     bytes: &'m [u8],
+}
+
+impl fmt::Debug for RawMetadata<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawMetadata")
+            .field("schema", &self.schema)
+            .field("bytes_len", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'m> RawMetadata<'m> {
