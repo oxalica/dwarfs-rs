@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::section::CompressAlgo;
 
+pub mod metadata;
 pub mod section;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -15,6 +16,7 @@ pub enum Error {
     ChecksumMismatch,
     IntegerOverflow,
     UnknowCompressAlgo(CompressAlgo),
+    InvalidSchema,
     Io(std::io::Error),
 }
 
@@ -29,6 +31,9 @@ impl fmt::Display for Error {
             Error::UnknowCompressAlgo(algo) => {
                 return write!(f, "unknown section compress algorithm {algo:?}");
             }
+
+            Error::InvalidSchema => "invalid metadata schema",
+
             Error::Io(err) => return err.fmt(f),
         })
     }
