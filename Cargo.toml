@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
+zstd = "0.13.3"
 
 [lints.clippy]
 dbg-macro = "warn"

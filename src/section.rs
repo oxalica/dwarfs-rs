@@ -262,6 +262,22 @@ impl<R: Read + ?Sized> SectionReader<R> {
         }
     }
 
+    /// Read and decompress section data of given section header.
+    pub fn read_data(&mut self, header: &Header) -> Result<Vec<u8>> {
+        let data_len =
+            usize::try_from(header.data_len.get()).map_err(|_| Error::IntegerOverflow)?;
+        let mut raw_data = vec![0u8; data_len];
+        self.rdr.read_exact(&mut raw_data)?;
+        header.validate_fast_checksum(&raw_data)?;
+
+        match header.compress_algo {
+            CompressAlgo::NONE => Ok(raw_data),
+            CompressAlgo::ZSTD => Ok(zstd::decode_all(&raw_data[..])?),
+            // TODO: More algorithms.
+            algo => Err(Error::UnknowCompressAlgo(algo)),
+        }
+    }
+
     /// Seek and read the section index, assuming its existence.
     pub fn seek_read_section_index(
         &mut self,

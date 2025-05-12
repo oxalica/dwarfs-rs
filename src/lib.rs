@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::section::CompressAlgo;
+
 pub mod section;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -12,6 +14,7 @@ pub enum Error {
     LengthMismatch,
     ChecksumMismatch,
     IntegerOverflow,
+    UnknowCompressAlgo(CompressAlgo),
     Io(std::io::Error),
 }
 
@@ -23,6 +26,9 @@ impl fmt::Display for Error {
             Error::LengthMismatch => "length mismatch",
             Error::ChecksumMismatch => "checksum mismatch",
             Error::IntegerOverflow => "integer overflow",
+            Error::UnknowCompressAlgo(algo) => {
+                return write!(f, "unknown section compress algorithm {algo:?}");
+            }
             Error::Io(err) => return err.fmt(f),
         })
     }
