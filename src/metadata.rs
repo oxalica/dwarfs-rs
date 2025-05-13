@@ -1,12 +1,14 @@
+//! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
 use std::{fmt, marker::PhantomData};
 
-use self::sealed::FieldType;
-use crate::{
-    Error, Result,
-    metadata::schema::{SchemaField, SchemaLayout},
-};
+use self::frozen::{FromRaw, Source, Str};
+use self::schema::SchemaLayout;
+use crate::{Error, Result};
 
+mod frozen;
 mod schema;
+
+pub use self::frozen::{List, ListIter, Map};
 
 pub struct Schema(schema::Schema);
 
@@ -22,176 +24,165 @@ impl Schema {
             .map(Self)
             .map_err(|_| Error::InvalidSchema)
     }
-
-    fn layout(&self, idx: u16) -> &SchemaLayout {
-        self.0.get_layout(idx).expect("layout index out of bound")
-    }
 }
 
-#[derive(Clone, Copy)]
-pub struct RawMetadata<'m> {
-    schema: &'m Schema,
-    bytes: &'m [u8],
-}
-
-impl fmt::Debug for RawMetadata<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawMetadata")
-            .field("schema", &self.schema)
-            .field("bytes_len", &self.bytes.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl<'m> RawMetadata<'m> {
-    pub fn new(schema: &'m Schema, bytes: &'m [u8]) -> Self {
-        Self { schema, bytes }
-    }
-
-    fn load_bits(&self, mut base: u64, bits: u16) -> u64 {
-        // FIXME: Optimize this.
-        let mut ret = 0u64;
-        for i in 0..bits {
-            let bit = (self.bytes[base as usize / 8] >> (base % 8)) & 1;
-            ret |= (bit as u64) << i;
-            base += 1;
+macro_rules! define_value_struct {
+    (__getter [] $($tt:tt)*) => {};
+    (__getter [$vis:vis] [$($meta:tt)*] $($tt:tt)*) => {
+        $($meta)*
+        $vis $($tt)*
+    };
+    ($(
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident<$a:lifetime> {
+            $(
+                $(#[$field_meta:meta])*
+                $([$getter_vis:tt])?
+                $field:ident : $field_ty:ty = $field_id:literal,
+            )*
         }
-        ret
-    }
-
-    fn load_field_bits(&self, base_bit: u64, field: Option<SchemaField>) -> u64 {
-        if let Some(f) = field {
-            let base_bit = base_bit + f.offset_bits();
-            let layout = self.schema.layout(f.layout_id);
-            debug_assert!(layout.fields.is_empty());
-            self.load_bits(base_bit, layout.bits)
-        } else {
-            0
-        }
-    }
-
-    fn load_field_list(&self, base_bit: u64, field: Option<SchemaField>) -> RawList {
-        if let Some(f) = field {
-            let base_bit = base_bit + f.offset_bits();
-            let list_layout = self.schema.layout(f.layout_id);
-            let dist = self.load_field_bits(base_bit, list_layout.get_field(1));
-            let len = self.load_field_bits(base_bit, list_layout.get_field(2));
-            let elem_layout = list_layout.get_field(3).map(|f| f.layout_id);
-            let elem_bits = elem_layout.map_or(0, |lid| self.schema.layout(lid).bits);
-            RawList {
-                len,
-                base_bit: base_bit + dist * 8,
-                elem_layout,
-                elem_bits,
+    )*) => {
+        $(
+            $(#[$meta])*
+            $vis struct $name<$a> {
+                $($field : $field_ty,)*
+                _marker: PhantomData<&$a [u8]>,
             }
-        } else {
-            RawList::default()
-        }
-    }
+
+            impl<$a> FromRaw<$a> for $name<$a> {
+                fn load(src: &Source<$a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+                    Self {
+                        $($field: src.load_field(base_bit, layout, $field_id),)*
+                        _marker: PhantomData,
+                    }
+                }
+
+                fn from_empty(src: &Source<$a>) -> Self {
+                    Self {
+                        $($field: FromRaw::from_empty(src),)*
+                        _marker: PhantomData,
+                    }
+                }
+            }
+
+            impl<$a> $name<$a> {
+                $(define_value_struct! {
+                    __getter
+                    [$($getter_vis)?]
+                    [$(#[$field_meta])*]
+                    fn $field(&self) -> $field_ty {
+                        self.$field
+                    }
+                })*
+            }
+        )*
+    };
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RawList {
-    len: u64,
-    base_bit: u64,
-    elem_layout: Option<u16>,
-    elem_bits: u16,
-}
-
-#[derive(Debug)]
-pub struct Metadata<'m, 'a> {
-    meta: &'m RawMetadata<'a>,
-
-    chunks: RawList,
-}
-
-impl<'m, 'a> Metadata<'m, 'a> {
-    // FIXME: Validate this.
-    pub fn parse(meta: &'m RawMetadata<'a>) -> Self {
-        let layout = meta.schema.layout(meta.schema.0.root_layout);
-        let base = 0;
-
-        let chunks = meta.load_field_list(base, layout.get_field(1));
-
-        Self { meta, chunks }
-    }
-
-    pub fn chunks(&self) -> List<'_, 'a, Chunk> {
-        List {
-            meta: self.meta,
-            raw: self.chunks,
-            _marker: PhantomData,
-        }
-    }
-}
-
-mod sealed {
-    use super::*;
-    pub trait FieldType<'a>: Sized {
-        fn load_from(
-            meta: &RawMetadata<'a>,
-            layout: Option<&'a SchemaLayout>,
-            base_bit: u64,
-        ) -> Self;
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct List<'m, 'a, T> {
-    meta: &'m RawMetadata<'a>,
-    raw: RawList,
-    _marker: PhantomData<T>,
-}
-
-impl<'a, T: FieldType<'a>> List<'_, 'a, T> {
-    pub fn len(&self) -> usize {
-        self.raw.len as _
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn at(&self, i: usize) -> T {
-        assert!(i < self.len());
-        let base_bit = self.raw.base_bit + i as u64 * self.raw.elem_bits as u64;
-        let layout = self.raw.elem_layout.map(|lid| self.meta.schema.layout(lid));
-        T::load_from(self.meta, layout, base_bit)
-    }
-}
-
-impl<'a, T: FieldType<'a>> Iterator for List<'_, 'a, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.is_empty() {
-            let v = self.at(0);
-            self.raw.len -= 1;
-            self.raw.base_bit += u64::from(self.raw.elem_bits);
-            Some(v)
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct Chunk {
-    pub block: u32,
-    pub offset: u32,
-    pub size: u32,
-}
-
-impl<'a> FieldType<'a> for Chunk {
-    fn load_from(data: &RawMetadata<'a>, layout: Option<&'a SchemaLayout>, base_bit: u64) -> Self {
-        let Some(layout) = layout else {
-            return Self::default();
+impl<'a> Metadata<'a> {
+    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Self {
+        // FIXME: Validate this.
+        let src = Source {
+            schema: &schema.0,
+            bytes,
         };
-        Self {
-            block: data.load_field_bits(base_bit, layout.get_field(1)) as u32,
-            offset: data.load_field_bits(base_bit, layout.get_field(2)) as u32,
-            size: data.load_field_bits(base_bit, layout.get_field(3)) as u32,
-        }
+        let layout = &src.schema[src.schema.root_layout];
+        src.load(0, layout)
+    }
+}
+
+define_value_struct! {
+    #[derive(Debug)]
+    pub struct Metadata<'a> {
+        [pub] chunks: List<'a, Chunk<'a>> = 1,
+        [pub] directories: List<'a, Directory<'a>> = 2,
+        [pub] inodes: List<'a, InodeData<'a>> = 3,
+        [pub] chunk_table: List<'a, u32> = 4,
+        #[deprecated = "deprecated since dwarfs 2.3"]
+        [pub] entry_table: List<'a, u32> = 5,
+        [pub] symlink_table: List<'a, u32> = 6,
+        [pub] uids: List<'a, u32> = 7,
+        [pub] gids: List<'a, u32> = 8,
+        [pub] modes: List<'a, u32> = 9,
+        [pub] names: List<'a, Str<'a>> = 10,
+        [pub] symlinks: List<'a, Str<'a>> = 11,
+        [pub] timestamp_base: u64 = 12,
+        [pub] chunk_inode_offset: u32 = 13,
+        [pub] link_inode_offset: u32 = 14,
+        [pub] block_size: u32 = 15,
+        [pub] total_fs_size: u64 = 16,
+        [pub] devices: Option<List<'a, u64>> = 17,
+
+        [pub] options: Option<FsOptions<'a>> = 18,
+        [pub] dir_entries: Option<List<'a, DirEntry<'a>>> = 19,
+        [pub] shared_files_table: Option<List<'a, u32>> = 20,
+        [pub] total_hardlink_size: Option<u64> = 21,
+        [pub] dwarfs_version: Option<Str<'a>> = 22,
+        [pub] create_timestamp: Option<u64> = 23,
+        [pub] compact_names: Option<StringTable<'a>> = 24,
+        [pub] compact_symlinks: Option<StringTable<'a>> = 25,
+        [pub] preferred_path_separator: Option<u32> = 26,
+        // features: Option<Set> = 27, // I don't know the layout of Set, because there is currently no features.
+        [pub] category_names: Option<List<'a, Str<'a>>> = 28,
+        [pub] block_categories: Option<List<'a, Str<'a>>> = 29,
+        [pub] reg_file_size_cache: Option<InodeSizeCache<'a>> = 30,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Chunk<'a> {
+        [pub] block: u32 = 1,
+        [pub] offset: u32 = 2,
+        [pub] size: u32 = 3,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct Directory<'a> {
+        [pub] parent_entry: u32 = 1,
+        [pub] first_entry: u32 = 2,
+        [pub] self_entry: u32 = 3,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct InodeData<'a> {
+        [pub] mode_index: u32 = 2,
+        [pub] owner_index: u32 = 4,
+        [pub] group_index: u32 = 5,
+        [pub] atime_offset: u32 = 6,
+        [pub] mtime_offset: u32 = 7,
+        [pub] ctime_offset: u32 = 8,
+
+        #[deprecated = "deprecated since dwarfs 2.3"]
+        [pub] name_index: u32 = 1,
+        #[deprecated = "deprecated since dwarfs 2.3"]
+        [pub] inode: u32 = 3,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct DirEntry<'a> {
+        [pub] name_index: u32 = 1,
+        [pub] inode_num: u32 = 2,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct FsOptions<'a> {
+        [pub] mtime_only: bool = 1,
+        [pub] time_resolution_sec: Option<u32> = 2,
+        [pub] packed_chunk_table: bool = 3,
+        [pub] packed_directories: bool = 4,
+        [pub] packed_shared_files_table: bool = 5,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct StringTable<'a> {
+        [pub] buffer: Str<'a> = 1,
+        [pub] symtab: Option<Str<'a>> = 2,
+        [pub] index: List<'a, u32> = 3,
+        [pub] packed_index: bool = 4,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub struct InodeSizeCache<'a> {
+        [pub] lookup: Map<'a, u32, u64> = 1,
+        [pub] min_chunk_count: u64 = 2,
     }
 }

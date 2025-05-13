@@ -1,7 +1,7 @@
 //! Mini thrift decoder, with fbthrift flavor.
 //!
 //! <https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md>
-use std::fmt;
+use std::{fmt, ops};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -154,7 +154,7 @@ pub struct Schema {
 
 struct DebugVecMap<'a, T>(&'a Vec<Option<T>>);
 
-impl<'a, T: fmt::Debug> fmt::Debug for DebugVecMap<'a, T> {
+impl<T: fmt::Debug> fmt::Debug for DebugVecMap<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_map()
             .entries(
@@ -179,8 +179,16 @@ impl fmt::Debug for Schema {
 }
 
 impl Schema {
-    pub fn get_layout(&self, idx: u16) -> Option<&SchemaLayout> {
+    pub fn layout(&self, idx: u16) -> Option<&SchemaLayout> {
         self.layouts.get(usize::from(idx))?.as_ref()
+    }
+}
+
+impl ops::Index<u16> for Schema {
+    type Output = SchemaLayout;
+
+    fn index(&self, index: u16) -> &Self::Output {
+        self.layout(index).expect("layout index out of bound")
     }
 }
 
@@ -203,7 +211,7 @@ impl fmt::Debug for SchemaLayout {
 }
 
 impl SchemaLayout {
-    pub fn get_field(&self, idx: u16) -> Option<SchemaField> {
+    pub fn field(&self, idx: u16) -> Option<SchemaField> {
         *self.fields.get(usize::from(idx))?
     }
 }
@@ -232,13 +240,13 @@ pub fn parse_schema(src: &[u8]) -> Result<Schema> {
 
     if schema.file_version != FILE_VERSION
         || !schema.relax_type_checks
-        || schema.get_layout(schema.root_layout).is_none()
+        || schema.layout(schema.root_layout).is_none()
     {
         return Err(Error::InvalidVersion);
     }
     for layout in schema.layouts.iter().flatten() {
         for field in layout.fields.iter().flatten() {
-            if schema.get_layout(field.layout_id).is_none() {
+            if schema.layout(field.layout_id).is_none() {
                 return Err(Error::InvalidVersion);
             }
         }
