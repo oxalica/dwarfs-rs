@@ -126,18 +126,57 @@ impl<'a> Source<'a> {
         })
     }
 
-    fn load_bits(&self, mut base_bit: Offset, bits: u16) -> u64 {
-        // Already checked by schema validation.
-        debug_assert!(bits <= 64);
+    /// Load 1 bits at `base_bit`, using little-endian.
+    ///
+    /// This assumes the input is in bound. Validation should be done on structs.
+    fn load_bit(&self, base_bit: Offset) -> Result<bool> {
+        let (byte_idx, bit_idx) = (to_usize(base_bit) / 8, base_bit % 8);
+        let b = *self.bytes.get(byte_idx).ok_or("bit location overflow")?;
+        Ok((b >> bit_idx) & 1 != 0)
+    }
 
-        // FIXME: Optimize this.
-        let mut ret = 0u64;
-        for i in 0..bits {
-            let bit = (self.bytes[to_usize(base_bit) / 8] >> (base_bit % 8)) & 1;
-            ret |= u64::from(bit) << i;
-            base_bit += 1;
+    /// Load `bits` bits starting at `base_bit`, using little-endian,
+    /// fill upper bits as 0.
+    ///
+    /// This assumes the input is in bound. Validation should be done on structs.
+    fn load_bits(&self, base_bit: Offset, bits: u16) -> Result<u64> {
+        // Already checked by schema validation.
+        debug_assert!(bits > 0);
+        debug_assert!(bits <= 64);
+        let (byte_idx, bit_start) = (to_usize(base_bit) / 8, base_bit as u16 % 8);
+        let last_byte_idx = (base_bit + Offset::from(bits) - 1) / 8;
+        if to_usize(last_byte_idx) >= self.bytes.len() {
+            return Err("bits location overflow".into());
         }
-        ret
+
+        // Always load a 8-byte chunk for performance.
+        let rest = &self.bytes[byte_idx..];
+        let x = if rest.len() >= 8 {
+            u64::from_le_bytes(rest[..8].try_into().unwrap())
+        } else {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            u64::from_le_bytes(buf)
+        };
+
+        let start_and_bits = bit_start + bits;
+        Ok(if start_and_bits <= 64 {
+            // Simple case:
+            // Bit | 63, 62, ...          1, 0 |
+            //     |up_bits|  bits | bit_start |
+            //             ~~~~~~~~~ target
+            x << (64 - start_and_bits) >> (64 - bits)
+        } else {
+            // Overshooting case:
+            // Bit | 71 .. 64 | 63, 62, ...          1, 0 |
+            //     |     |      bits          | bit_start |
+            //           ~~~~~~~~~~~~~~~~~~~~~~ target
+
+            // We need the 9-th (idx=8) byte. This can only happen if bits >= 56.
+            let overshooting_bits = start_and_bits & 63;
+            let hi = u64::from(rest[8]);
+            x >> bit_start | hi << (64 - overshooting_bits) >> (64 - bits)
+        })
     }
 
     pub(crate) fn load<T: FromRaw<'a>>(self, base_bit: Offset, layout: &SchemaLayout) -> Result<T> {
@@ -163,9 +202,8 @@ macro_rules! impl_int_from_raw {
     ($($i:tt),* $(,)?) => {
         $(impl<'a> FromRaw<'a> for $i {
             fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
-                // TODO: Error handling.
                 assert!(layout.fields.is_empty());
-                let v = src.load_bits(base_bit, layout.bits);
+                let v = src.load_bits(base_bit, layout.bits)?;
                 Ok(Self::try_from(v).ok().ok_or(concat!("integer overflow for ", stringify!($i)))?)
             }
             fn empty(_: Source<'a>) -> Self {
@@ -175,17 +213,19 @@ macro_rules! impl_int_from_raw {
     };
 }
 
-impl_int_from_raw!(u8, u16, u32, u64);
+impl_int_from_raw!(u32, u64);
 
 impl<'a> FromRaw<'a> for bool {
     fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
-        if layout.bits != 1 {
-            return Err("invalid bit length for bool".into());
+        // If this bool occupies zero-bit, the field should be eliminated and
+        // `FromRaw::empty` will be called instead.
+        if layout.bits == 1 {
+            src.load_bit(base_bit)
+        } else {
+            Err("invalid bit length for bool".into())
         }
-        debug_assert!(layout.bits <= 1);
-        // TODO: This can be more efficient.
-        Ok(u8::load(src, base_bit, layout)? != 0)
     }
+
     fn empty(_: Source<'a>) -> Self {
         false
     }

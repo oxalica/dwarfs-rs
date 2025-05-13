@@ -37,6 +37,7 @@ pub(crate) enum Error {
     LayoutIdOutOfBound,
     LayoutOffsetOverflow,
     LayoutPrimitiveTooLarge,
+    LayoutFieldExceedStruct,
 }
 
 impl fmt::Display for OpaqueError {
@@ -53,6 +54,7 @@ impl fmt::Display for OpaqueError {
             Error::LayoutIdOutOfBound => "layout id out of bound",
             Error::LayoutOffsetOverflow => "layout offset overflow",
             Error::LayoutPrimitiveTooLarge => "layout size is too large for primitive types",
+            Error::LayoutFieldExceedStruct => "layout field exceeds its containing struct",
         })
     }
 }
@@ -294,17 +296,20 @@ pub(crate) fn parse_schema(src: &[u8]) -> Result<Schema> {
         }
 
         for field in layout.fields.iter().flatten() {
-            if schema.layout(field.layout_id).is_none() {
+            let Some(field_layout) = schema.layout(field.layout_id) else {
                 return Err(Error::LayoutIdOutOfBound);
-            }
-
-            let ok = if field.offset >= 0 {
-                field.offset.checked_mul(8).is_some()
-            } else {
-                field.offset.checked_neg().is_some()
             };
-            if !ok {
+
+            let Some(bit_offset) = (if field.offset >= 0 {
+                field.offset.checked_mul(8)
+            } else {
+                field.offset.checked_neg()
+            }) else {
                 return Err(Error::LayoutOffsetOverflow);
+            };
+
+            if (bit_offset as u16).checked_add(field_layout.bits).is_none() {
+                return Err(Error::LayoutFieldExceedStruct);
             }
         }
     }
