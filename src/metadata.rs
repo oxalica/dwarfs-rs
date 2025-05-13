@@ -8,7 +8,7 @@ use crate::{Error, Result};
 mod frozen;
 mod schema;
 
-pub use self::frozen::{List, ListIter, Map};
+pub use self::frozen::{List, ListIter, Map, MapIter, Set, SetIter};
 
 pub struct Schema(schema::Schema);
 
@@ -122,7 +122,7 @@ define_value_struct! {
         [pub] compact_names: Option<StringTable<'a>> = 24,
         [pub] compact_symlinks: Option<StringTable<'a>> = 25,
         [pub] preferred_path_separator: Option<u32> = 26,
-        // features: Option<Set> = 27, // I don't know the layout of Set, because there is currently no features.
+        [pub] features: Option<Set<'a, Str<'a>>> = 27,
         [pub] category_names: Option<List<'a, Str<'a>>> = 28,
         [pub] block_categories: Option<List<'a, Str<'a>>> = 29,
         [pub] reg_file_size_cache: Option<InodeSizeCache<'a>> = 30,

@@ -14,7 +14,7 @@
 //! - Me (oxalica) reverse engineering bytes layouts in dwarfs metadata block, and
 //!   comparing with the metadata dump from:
 //!   `dwarfsck $imgfile -d metadata_full_dump`
-use std::{fmt, marker::PhantomData};
+use std::{borrow::Borrow, cmp::Ordering, fmt, marker::PhantomData, ops::Range};
 
 use bstr::BStr;
 
@@ -128,6 +128,7 @@ macro_rules! impl_tuple_from_raw {
     };
 }
 
+impl_tuple_from_raw!(A 1);
 impl_tuple_from_raw!(A 1, B 2);
 impl_tuple_from_raw!(A 1, B 2, C 3);
 
@@ -376,16 +377,46 @@ impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> Map<'a, K, V> {
     }
 
     /// Get the key-value tuple at index `idx`.
-    pub fn get(&self, idx: usize) -> Option<(K, V)> {
-        (idx < self.len()).then(|| self.raw.at(idx))
+    pub fn get_index_entry(&self, idx: usize) -> Option<(K, V)> {
+        (idx < self.len()).then(|| self.raw.at::<(K, V)>(idx))
     }
 
     /// Get the key-value tuple at index `idx`, or panic if it's out of bound.
     pub fn at(&self, idx: usize) -> (K, V) {
-        self.get(idx).expect("index out of bound")
+        self.get_index_entry(idx).expect("index out of bound")
     }
 
-    // TODO: More map methods and iterators.
+    /// Returns the index of the key, if it exists in the map.
+    pub fn get_index_of<Q>(&self, key: &Q) -> Option<usize>
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        bisect_range_by(0..self.len(), |i| {
+            Ord::cmp(self.raw.at::<(K,)>(i).0.borrow(), key)
+        })
+    }
+
+    /// Returns the key-value pair corresponding to the supplied key.
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        let i = self.get_index_of(key)?;
+        Some(self.raw.at::<(K, V)>(i))
+    }
+
+    /// Returns true if the set contains an element equal to the value.
+    pub fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        self.get_index_of(key).is_some()
+    }
+
+    // TODO: More map methods.
 }
 
 /// The [`Iterator`] of [`Map`].
@@ -426,5 +457,163 @@ impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> Iterator for MapIter<'a, K, V> {
         } else {
             None
         }
+    }
+}
+
+/// A lazy ordered set reference.
+pub struct Set<'a, T> {
+    raw: RawList<'a>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Copy for Set<'_, T> {}
+impl<T> Clone for Set<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, T> fmt::Debug for Set<'a, T>
+where
+    T: fmt::Debug + FromRaw<'a>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alt = f.alternate();
+        let mut d = f.debug_struct("Set");
+        d.field("len", &self.raw.len)
+            .field("elem_bits", &self.raw.elem_bits);
+        if alt {
+            d.field("elems", &self.into_iter()).finish()
+        } else {
+            d.finish_non_exhaustive()
+        }
+    }
+}
+
+impl<'a, T: FromRaw<'a>> FromRaw<'a> for Set<'a, T> {
+    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+        Self {
+            raw: RawList::load(src, base_bit, layout),
+            _marker: PhantomData,
+        }
+    }
+
+    fn empty(src: Source<'a>) -> Self {
+        Set {
+            raw: RawList::empty(src),
+            _marker: PhantomData,
+        }
+    }
+}
+
+#[expect(private_bounds, reason = "all exposed types implement this")]
+impl<'a, T: FromRaw<'a>> Set<'a, T> {
+    /// The number of elements in this set.
+    pub fn len(&self) -> usize {
+        self.raw.len as _
+    }
+
+    /// Return `true` if this set contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Get the element at index `idx`.
+    pub fn get_index(&self, idx: usize) -> Option<T> {
+        (idx < self.len()).then(|| self.raw.at(idx))
+    }
+
+    /// Get the element at index `idx`, or panic if it's out of bound.
+    pub fn at(&self, idx: usize) -> T {
+        self.get_index(idx).expect("index out of bound")
+    }
+
+    /// Returns the index of the value, if it exists in the map.
+    pub fn get_index_of<Q>(&self, value: &Q) -> Option<usize>
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        bisect_range_by(0..self.len(), |i| {
+            Ord::cmp(self.raw.at::<T>(i).borrow(), value)
+        })
+    }
+
+    /// Returns true if the set contains an element equal to the value.
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        self.get_index_of(value).is_some()
+    }
+}
+
+/// The [`Iterator`] of [`Set`].
+pub struct SetIter<'a, T>(usize, Set<'a, T>);
+
+impl<T> Clone for SetIter<'_, T> {
+    fn clone(&self) -> Self {
+        Self(self.0, self.1)
+    }
+}
+
+impl<'a, T: fmt::Debug + FromRaw<'a>> fmt::Debug for SetIter<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.clone()).finish()
+    }
+}
+
+impl<'a, T: FromRaw<'a>> IntoIterator for Set<'a, T> {
+    type IntoIter = SetIter<'a, T>;
+    type Item = T;
+    fn into_iter(self) -> Self::IntoIter {
+        SetIter(0, self)
+    }
+}
+
+// TODO: More iterator traits and functions.
+impl<'a, T: FromRaw<'a>> Iterator for SetIter<'a, T> {
+    type Item = T;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.0 < self.1.len() {
+            let v = self.1.raw.at(self.0);
+            self.0 += 1;
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+/// There is currently no binary search functions in std over a generic range.
+/// This is copied from std: <https://github.com/rust-lang/rust/blob/1.86.0/library/core/src/slice/mod.rs#L2817>
+/// License: MIT OR Apache-2.0
+pub fn bisect_range_by<F>(range: Range<usize>, mut f: F) -> Option<usize>
+where
+    F: FnMut(usize) -> Ordering,
+{
+    let total_size = range.end - range.start;
+    let mut size = total_size;
+    if size == 0 {
+        return None;
+    }
+    let mut base = 0usize;
+
+    while size > 1 {
+        let half = size / 2;
+        let mid = base + half;
+        let cmp = f(mid);
+        // WAIT: Rust 1.88
+        // base = (cmp == Ordering::Greater).select_unpredictable(base, mid);
+        base = if cmp == Ordering::Greater { base } else { mid };
+        size -= half;
+    }
+
+    let cmp = f(base);
+    if cmp == Ordering::Equal {
+        debug_assert!(base < total_size);
+        Some(base)
+    } else {
+        None
     }
 }
