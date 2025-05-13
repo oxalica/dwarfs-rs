@@ -3,12 +3,48 @@ use std::{fmt, marker::PhantomData};
 
 use self::frozen::{FromRaw, Offset, Source, Str};
 use self::schema::SchemaLayout;
-use crate::{Error, Result};
 
 mod frozen;
 mod schema;
 
 pub use self::frozen::{List, ListIter, Map, MapIter, Set, SetIter};
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+pub struct Error(Box<ErrorKind>);
+
+#[derive(Debug)]
+enum ErrorKind {
+    Schema(schema::Error),
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &*self.0 {
+            ErrorKind::Schema(err) => write!(f, "invalid schema: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &*self.0 {
+            ErrorKind::Schema(err) => Some(err),
+        }
+    }
+}
+
+impl From<schema::Error> for Error {
+    fn from(err: schema::Error) -> Self {
+        Self(Box::new(ErrorKind::Schema(err)))
+    }
+}
 
 pub struct Schema(schema::Schema);
 
@@ -20,9 +56,7 @@ impl fmt::Debug for Schema {
 
 impl Schema {
     pub fn parse(src: &[u8]) -> Result<Self> {
-        schema::parse_schema(src)
-            .map(Self)
-            .map_err(|_| Error::InvalidSchema)
+        Ok(Self(schema::parse_schema(src)?))
     }
 }
 

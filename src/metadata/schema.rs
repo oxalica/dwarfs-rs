@@ -3,22 +3,44 @@
 //! <https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md>
 use std::{fmt, ops};
 
-type Result<T, E = Error> = std::result::Result<T, E>;
+use bstr::BString;
+
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
-    Eof,
-    VarintTooLong,
-    Overflow,
+    UnexpectedEof,
+    VarIntTooLong,
+    IntegerOverflow,
     InvalidFieldTag,
     UnexpectedType,
-    InvalidUtf8,
 
     UnknownField,
     MissingField,
 
-    InvalidVersion,
+    InvalidFileVersion,
+    LayoutIdOutOfBound,
+    LayoutOffsetOverflow,
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Error::UnexpectedEof => "reached unexpected EOF",
+            Error::VarIntTooLong => "invalid encoded varint",
+            Error::IntegerOverflow => "integer overflow",
+            Error::InvalidFieldTag => "invalid field",
+            Error::UnexpectedType => "unexpected type",
+            Error::UnknownField => "unknown field",
+            Error::MissingField => "missing field",
+            Error::InvalidFileVersion => "invalid file version",
+            Error::LayoutIdOutOfBound => "layout id out of bound",
+            Error::LayoutOffsetOverflow => "layout offset overflow",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
 
 struct Decoder<'a> {
     rest: &'a [u8],
@@ -26,13 +48,16 @@ struct Decoder<'a> {
 
 impl<'a> Decoder<'a> {
     fn next_byte(&mut self) -> Result<u8> {
-        let (&fst, rest) = self.rest.split_first().ok_or(Error::Eof)?;
+        let (&fst, rest) = self.rest.split_first().ok_or(Error::UnexpectedEof)?;
         self.rest = rest;
         Ok(fst)
     }
 
     fn next_take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let (fst, rest) = self.rest.split_at_checked(len).ok_or(Error::Eof)?;
+        let (fst, rest) = self
+            .rest
+            .split_at_checked(len)
+            .ok_or(Error::UnexpectedEof)?;
         self.rest = rest;
         Ok(fst)
     }
@@ -46,26 +71,24 @@ impl<'a> Decoder<'a> {
                 return Ok(x);
             }
         }
-        Err(Error::VarintTooLong)
+        Err(Error::VarIntTooLong)
     }
 
     fn decode_uint<T: TryFrom<u64>>(&mut self) -> Result<T> {
         let x = self.decode_varint()?;
-        x.try_into().map_err(|_| Error::Overflow)
+        x.try_into().map_err(|_| Error::IntegerOverflow)
     }
 
     fn decode_sint<T: TryFrom<i64>>(&mut self) -> Result<T> {
         let x = self.decode_varint()?;
         let x = (x >> 1) as i64 ^ -(x as i64 & 1);
-        x.try_into().map_err(|_| Error::Overflow)
+        x.try_into().map_err(|_| Error::IntegerOverflow)
     }
 
-    fn decode_string(&mut self) -> Result<String> {
+    fn decode_string(&mut self) -> Result<BString> {
         let size = self.decode_uint::<usize>()?;
-        let s = std::str::from_utf8(self.next_take(size)?)
-            .ok()
-            .ok_or(Error::InvalidUtf8)?;
-        Ok(s.to_owned())
+        let s = self.next_take(size)?.to_vec();
+        Ok(s.into())
     }
 
     fn decode_field_header(&mut self, field_id: &mut i16) -> Result<Option<(i16, Tag)>> {
@@ -76,7 +99,9 @@ impl<'a> Decoder<'a> {
 
         let id_delta = i16::from(b >> 4);
         *field_id = if id_delta != 0 {
-            field_id.checked_add(id_delta).ok_or(Error::Overflow)?
+            field_id
+                .checked_add(id_delta)
+                .ok_or(Error::IntegerOverflow)?
         } else {
             self.decode_sint::<i16>()?
         };
@@ -196,7 +221,7 @@ pub struct SchemaLayout {
     pub size: u32,
     pub bits: u16,
     pub fields: Vec<Option<SchemaField>>,
-    pub type_name: String,
+    pub type_name: BString,
 }
 
 impl fmt::Debug for SchemaLayout {
@@ -219,13 +244,14 @@ impl SchemaLayout {
 #[derive(Debug, Clone, Copy)]
 pub struct SchemaField {
     pub layout_id: u16,
-    pub offset: i16,
+    offset: i16,
 }
 
 impl SchemaField {
-    pub fn offset_bits(self) -> u64 {
+    pub fn offset_bits(self) -> u16 {
         let o = self.offset;
-        if o >= 0 { o as u64 * 8 } else { -o as u64 }
+        // We checked in `parse_schema` that these will not overflow.
+        if o >= 0 { o as u16 * 8 } else { (-o) as u16 }
     }
 }
 
@@ -242,12 +268,21 @@ pub fn parse_schema(src: &[u8]) -> Result<Schema> {
         || !schema.relax_type_checks
         || schema.layout(schema.root_layout).is_none()
     {
-        return Err(Error::InvalidVersion);
+        return Err(Error::InvalidFileVersion);
     }
+
     for layout in schema.layouts.iter().flatten() {
         for field in layout.fields.iter().flatten() {
             if schema.layout(field.layout_id).is_none() {
-                return Err(Error::InvalidVersion);
+                return Err(Error::LayoutIdOutOfBound);
+            }
+            let ok = if field.offset >= 0 {
+                field.offset.checked_mul(8).is_some()
+            } else {
+                field.offset.checked_neg().is_some()
+            };
+            if !ok {
+                return Err(Error::LayoutOffsetOverflow);
             }
         }
     }
