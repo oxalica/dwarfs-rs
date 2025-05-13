@@ -1,50 +1,14 @@
 //! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
 use std::{fmt, marker::PhantomData};
 
-use self::frozen::{FromRaw, Offset, Source, Str};
+use self::frozen::{FromRaw, Offset, ResultExt as _, Source, Str};
 use self::schema::SchemaLayout;
 
 mod frozen;
 mod schema;
 
-pub use self::frozen::{List, ListIter, Map, MapIter, Set, SetIter};
-
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-pub struct Error(Box<ErrorKind>);
-
-#[derive(Debug)]
-enum ErrorKind {
-    Schema(schema::Error),
-}
-
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &*self.0 {
-            ErrorKind::Schema(err) => write!(f, "invalid schema: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &*self.0 {
-            ErrorKind::Schema(err) => Some(err),
-        }
-    }
-}
-
-impl From<schema::Error> for Error {
-    fn from(err: schema::Error) -> Self {
-        Self(Box::new(ErrorKind::Schema(err)))
-    }
-}
+pub use frozen::{Error as MetadataError, List, ListIter, Map, MapIter, Set, SetIter};
+pub use schema::OpaqueError as SchemaError;
 
 pub struct Schema(schema::Schema);
 
@@ -55,7 +19,7 @@ impl fmt::Debug for Schema {
 }
 
 impl Schema {
-    pub fn parse(src: &[u8]) -> Result<Self> {
+    pub fn parse(src: &[u8]) -> Result<Self, SchemaError> {
         Ok(Self(schema::parse_schema(src)?))
     }
 }
@@ -84,11 +48,12 @@ macro_rules! define_value_struct {
             }
 
             impl<$a> FromRaw<$a> for $name<$a> {
-                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-                    Self {
-                        $($field: src.load_field(base_bit, layout, $field_id),)*
+                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self, MetadataError> {
+                    Ok(Self {
+                        $($field: src.load_field(base_bit, layout, $field_id)
+                            .context(concat!(stringify!($name), ".", stringify!($field)))?,)*
                         _marker: PhantomData,
-                    }
+                    })
                 }
 
                 fn empty(src: Source<$a>) -> Self {
@@ -114,8 +79,7 @@ macro_rules! define_value_struct {
 }
 
 impl<'a> Metadata<'a> {
-    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Self {
-        // FIXME: Validate this.
+    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self, MetadataError> {
         let src = Source {
             schema: &schema.0,
             bytes,

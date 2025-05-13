@@ -7,8 +7,23 @@ use bstr::BString;
 
 type Result<T> = std::result::Result<T, Error>;
 
+pub struct OpaqueError(Error);
+
+impl fmt::Debug for OpaqueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Error> for OpaqueError {
+    #[cold]
+    fn from(err: Error) -> Self {
+        Self(err)
+    }
+}
+
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     UnexpectedEof,
     VarIntTooLong,
     IntegerOverflow,
@@ -21,11 +36,12 @@ pub enum Error {
     InvalidFileVersion,
     LayoutIdOutOfBound,
     LayoutOffsetOverflow,
+    LayoutPrimitiveTooLarge,
 }
 
-impl fmt::Display for Error {
+impl fmt::Display for OpaqueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(match self {
+        f.pad(match self.0 {
             Error::UnexpectedEof => "reached unexpected EOF",
             Error::VarIntTooLong => "invalid encoded varint",
             Error::IntegerOverflow => "integer overflow",
@@ -36,11 +52,12 @@ impl fmt::Display for Error {
             Error::InvalidFileVersion => "invalid file version",
             Error::LayoutIdOutOfBound => "layout id out of bound",
             Error::LayoutOffsetOverflow => "layout offset overflow",
+            Error::LayoutPrimitiveTooLarge => "layout size is too large for primitive types",
         })
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for OpaqueError {}
 
 struct Decoder<'a> {
     rest: &'a [u8],
@@ -170,7 +187,7 @@ impl Tag {
     }
 }
 
-pub struct Schema {
+pub(crate) struct Schema {
     pub file_version: i32,
     pub relax_type_checks: bool,
     pub layouts: Vec<Option<SchemaLayout>>,
@@ -217,7 +234,7 @@ impl ops::Index<u16> for Schema {
     }
 }
 
-pub struct SchemaLayout {
+pub(crate) struct SchemaLayout {
     pub size: u32,
     pub bits: u16,
     pub fields: Vec<Option<SchemaField>>,
@@ -242,7 +259,7 @@ impl SchemaLayout {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SchemaField {
+pub(crate) struct SchemaField {
     pub layout_id: u16,
     offset: i16,
 }
@@ -258,7 +275,7 @@ impl SchemaField {
 /// Parse and validate field ranges.
 ///
 /// <https://github.com/facebook/fbthrift/blob/4375e4b08135d06fd56399b86ef93f3e6d43017c/thrift/lib/thrift/frozen.thrift#L42-L51>
-pub fn parse_schema(src: &[u8]) -> Result<Schema> {
+pub(crate) fn parse_schema(src: &[u8]) -> Result<Schema> {
     const FILE_VERSION: i32 = 1;
 
     let mut de = Decoder { rest: src };
@@ -272,10 +289,15 @@ pub fn parse_schema(src: &[u8]) -> Result<Schema> {
     }
 
     for layout in schema.layouts.iter().flatten() {
+        if layout.fields.is_empty() && layout.bits > 64 {
+            return Err(Error::LayoutPrimitiveTooLarge);
+        }
+
         for field in layout.fields.iter().flatten() {
             if schema.layout(field.layout_id).is_none() {
                 return Err(Error::LayoutIdOutOfBound);
             }
+
             let ok = if field.offset >= 0 {
                 field.offset.checked_mul(8).is_some()
             } else {

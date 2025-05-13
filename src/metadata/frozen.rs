@@ -26,9 +26,71 @@ use crate::metadata::schema::{Schema, SchemaLayout};
 /// it's efficiently bit-packed. Assume 4GiB is enough for it.
 pub(crate) type Offset = u32;
 
+// Assert that offset -> usize never overflows.
+fn to_usize(offset: Offset) -> usize {
+    const _: () = assert!(size_of::<Offset>() <= size_of::<usize>());
+    offset as usize
+}
+
+type Result<T> = std::result::Result<T, Error>;
+
+pub struct Error(Box<ErrorInner>);
+
+#[derive(Debug)]
+struct ErrorInner {
+    msg: &'static str,
+    context: String,
+}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0.msg)?;
+        f.write_str(&self.0.context)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<&'static str> for Error {
+    #[cold]
+    fn from(msg: &'static str) -> Self {
+        Self(Box::new(ErrorInner {
+            msg,
+            context: String::new(),
+        }))
+    }
+}
+
+impl Error {
+    #[cold]
+    fn append_context(mut self, msg: impl fmt::Display) -> Self {
+        use std::fmt::Write;
+        write!(self.0.context, ", in {msg}").unwrap();
+        self
+    }
+}
+
+pub(crate) trait ResultExt<T> {
+    fn context(self, msg: impl fmt::Display) -> Result<T>;
+}
+impl<T> ResultExt<T> for Result<T> {
+    fn context(self, msg: impl fmt::Display) -> Result<T> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(err) => Err(err.append_context(msg)),
+        }
+    }
+}
+
 /// Parsable types.
 pub(crate) trait FromRaw<'a>: Sized {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self;
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self>;
     fn empty(src: Source<'a>) -> Self;
 }
 
@@ -54,27 +116,31 @@ impl<'a> Source<'a> {
     // based on the new base location.
     // For structs, the base location is unchanged when iterating fields and
     // only bit offset is advanced.
-    fn rebase(self, distance: Offset) -> Self {
-        Self {
+    fn rebase(self, distance: Offset) -> Result<Self> {
+        Ok(Self {
             schema: self.schema,
-            bytes: &self.bytes[distance as usize..],
-        }
+            bytes: self
+                .bytes
+                .get(to_usize(distance)..)
+                .ok_or("distance overflow")?,
+        })
     }
 
     fn load_bits(&self, mut base_bit: Offset, bits: u16) -> u64 {
+        // Already checked by schema validation.
         debug_assert!(bits <= 64);
 
         // FIXME: Optimize this.
         let mut ret = 0u64;
         for i in 0..bits {
-            let bit = (self.bytes[base_bit as usize / 8] >> (base_bit % 8)) & 1;
-            ret |= (bit as u64) << i;
+            let bit = (self.bytes[to_usize(base_bit) / 8] >> (base_bit % 8)) & 1;
+            ret |= u64::from(bit) << i;
             base_bit += 1;
         }
         ret
     }
 
-    pub(crate) fn load<T: FromRaw<'a>>(self, base_bit: Offset, layout: &SchemaLayout) -> T {
+    pub(crate) fn load<T: FromRaw<'a>>(self, base_bit: Offset, layout: &SchemaLayout) -> Result<T> {
         FromRaw::load(self, base_bit, layout)
     }
 
@@ -83,11 +149,11 @@ impl<'a> Source<'a> {
         mut base_bit: Offset,
         layout: &SchemaLayout,
         field_id: u16,
-    ) -> T {
+    ) -> Result<T> {
         let Some(f) = layout.field(field_id) else {
-            return T::empty(self);
+            return Ok(T::empty(self));
         };
-        base_bit += f.offset_bits() as Offset;
+        base_bit += Offset::from(f.offset_bits());
         let layout = &self.schema[f.layout_id];
         self.load(base_bit, layout)
     }
@@ -96,11 +162,11 @@ impl<'a> Source<'a> {
 macro_rules! impl_int_from_raw {
     ($($i:tt),* $(,)?) => {
         $(impl<'a> FromRaw<'a> for $i {
-            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
+            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
                 // TODO: Error handling.
                 assert!(layout.fields.is_empty());
                 let v = src.load_bits(base_bit, layout.bits);
-                Self::try_from(v).unwrap()
+                Ok(Self::try_from(v).ok().ok_or(concat!("integer overflow for ", stringify!($i)))?)
             }
             fn empty(_: Source<'a>) -> Self {
                 0
@@ -112,9 +178,13 @@ macro_rules! impl_int_from_raw {
 impl_int_from_raw!(u8, u16, u32, u64);
 
 impl<'a> FromRaw<'a> for bool {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        if layout.bits != 1 {
+            return Err("invalid bit length for bool".into());
+        }
+        debug_assert!(layout.bits <= 1);
         // TODO: This can be more efficient.
-        u8::load(src, base_bit, layout) != 0
+        Ok(u8::load(src, base_bit, layout)? != 0)
     }
     fn empty(_: Source<'a>) -> Self {
         false
@@ -124,8 +194,11 @@ impl<'a> FromRaw<'a> for bool {
 macro_rules! impl_tuple_from_raw {
     ($($ty:ident $idx:literal),*) => {
         impl<'a, $($ty: FromRaw<'a>),*> FromRaw<'a> for ($($ty,)*) {
-            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-                ($(src.load_field(base_bit, layout, $idx),)*)
+            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+                Ok((
+                    $(src.load_field(base_bit, layout, $idx)
+                        .context(concat!("tuple field ", stringify!($idx)))?,)*
+                ))
             }
             fn empty(src: Source<'a>) -> Self {
                 ($(<$ty>::empty(src),)*)
@@ -136,15 +209,17 @@ macro_rules! impl_tuple_from_raw {
 
 impl_tuple_from_raw!(A 1);
 impl_tuple_from_raw!(A 1, B 2);
-impl_tuple_from_raw!(A 1, B 2, C 3);
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for Option<T> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        if src.load_field::<bool>(base_bit, layout, 1) {
-            Some(src.load_field(base_bit, layout, 2))
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        let is_some = src
+            .load_field::<bool>(base_bit, layout, 1)
+            .context("discriminant of optional")?;
+        Ok(if is_some {
+            Some(src.load_field(base_bit, layout, 2).context("optional")?)
         } else {
             None
-        }
+        })
     }
     fn empty(_src: Source<'a>) -> Self {
         None
@@ -155,11 +230,16 @@ impl<'a, T: FromRaw<'a>> FromRaw<'a> for Option<T> {
 pub(crate) type Str<'a> = &'a BStr;
 
 impl<'a> FromRaw<'a> for Str<'a> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        let (distance, count): (Offset, Offset) = src.load(base_bit, layout);
-        let bytes = &src.bytes[distance as usize..][..count as usize];
-        BStr::new(bytes)
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        let (distance, count) = src.load::<(Offset, Offset)>(base_bit, layout)?;
+        let content = src
+            .rebase(distance)?
+            .bytes
+            .get(..to_usize(count))
+            .ok_or("string length overflow")?;
+        Ok(BStr::new(content))
     }
+
     fn empty(_: Source<'a>) -> Self {
         BStr::new("")
     }
@@ -175,31 +255,58 @@ struct RawList<'a> {
 }
 
 impl<'a> RawList<'a> {
-    fn at<T: FromRaw<'a>>(&self, idx: usize) -> T {
-        if self.elem_bits == 0 {
-            return T::empty(self.elem_src);
+    fn load_validated<T: FromRaw<'a>>(
+        src: Source<'a>,
+        base_bit: Offset,
+        layout: &SchemaLayout,
+    ) -> Result<Self> {
+        let this = Self::load(src, base_bit, layout)?;
+        for i in 0..this.len() {
+            this.try_at::<T>(i).context(format_args!("list[{i}]"))?;
         }
-        let base_bit = idx as Offset * Offset::from(self.elem_bits);
+        Ok(this)
+    }
+
+    fn len(&self) -> usize {
+        to_usize(self.len)
+    }
+
+    fn try_at<T: FromRaw<'a>>(&self, idx: usize) -> Result<T> {
+        if self.elem_bits == 0 {
+            return Ok(T::empty(self.elem_src));
+        }
+        // We already checked this does not overflow in `RawList::load`.
+        let base_bit = (idx as Offset) * Offset::from(self.elem_bits);
         let layout = &self.elem_src.schema[self.elem_layout_id];
         self.elem_src.load(base_bit, layout)
+    }
+
+    fn at<T: FromRaw<'a>>(&self, idx: usize) -> T {
+        self.try_at(idx).expect("validated")
     }
 }
 
 impl<'a> FromRaw<'a> for RawList<'a> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        let (distance, count): (Offset, Offset) = src.load(base_bit, layout);
-        let elem_layout = layout.field(3).map(|f| f.layout_id);
-        let elem_bits = elem_layout.map_or(0, |lid| src.schema[lid].bits);
-        Self {
-            elem_src: src.rebase(distance),
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        let (distance, count) = src.load::<(Offset, Offset)>(base_bit, layout)?;
+        let elem_layout_id = layout.field(3).map(|f| f.layout_id);
+        let elem_src = src.rebase(distance)?;
+        let elem_bits = elem_layout_id.map_or(0, |lid| src.schema[lid].bits);
+        Offset::from(elem_bits)
+            .checked_mul(count)
+            .filter(|&bit_len| to_usize(bit_len.div_ceil(8)) <= elem_src.bytes.len())
+            .ok_or("list bit length overflow")?;
+
+        Ok(Self {
+            elem_src,
             len: count,
             // Layout field is `None` if:
             // - The list is empty, then it is unused anyway.
             // - The list element type consists of zero bits, that is, all elements are 0.
             //   This case is special cased in `RawList::at` and this field is unused.
-            elem_layout_id: elem_layout.unwrap_or(!0),
+            elem_layout_id: elem_layout_id.unwrap_or(!0),
             elem_bits,
-        }
+        })
     }
 
     fn empty(src: Source<'a>) -> Self {
@@ -246,11 +353,11 @@ where
 }
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for List<'a, T> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        Self {
-            raw: RawList::load(src, base_bit, layout),
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        Ok(Self {
+            raw: RawList::load_validated::<T>(src, base_bit, layout)?,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn empty(src: Source<'a>) -> Self {
@@ -265,7 +372,7 @@ impl<'a, T: FromRaw<'a>> FromRaw<'a> for List<'a, T> {
 impl<'a, T: FromRaw<'a>> List<'a, T> {
     /// The number of elements in this list.
     pub fn len(&self) -> usize {
-        self.raw.len as _
+        self.raw.len()
     }
 
     /// Return `true` if this list contains no elements.
@@ -275,7 +382,7 @@ impl<'a, T: FromRaw<'a>> List<'a, T> {
 
     /// Get the element at index `idx`.
     pub fn get(&self, idx: usize) -> Option<T> {
-        (idx < self.len()).then(|| self.raw.at(idx))
+        (idx < self.len()).then(|| self.raw.at::<T>(idx))
     }
 
     /// Get the element at index `idx`, or panic if it's out of bound.
@@ -312,7 +419,7 @@ impl<'a, T: FromRaw<'a>> Iterator for ListIter<'a, T> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
         if self.0 < self.1.len() {
-            let v = self.1.raw.at(self.0);
+            let v = self.1.raw.at::<T>(self.0);
             self.0 += 1;
             Some(v)
         } else {
@@ -355,11 +462,11 @@ where
 }
 
 impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> FromRaw<'a> for Map<'a, K, V> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        Self {
-            raw: src.load(base_bit, layout),
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        Ok(Self {
+            raw: RawList::load_validated::<(K, V)>(src, base_bit, layout)?,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn empty(src: Source<'a>) -> Self {
@@ -374,7 +481,7 @@ impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> FromRaw<'a> for Map<'a, K, V> {
 impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> Map<'a, K, V> {
     /// The number of elements in this map.
     pub fn len(&self) -> usize {
-        self.raw.len as _
+        self.raw.len()
     }
 
     /// Return `true` if this list contains no elements.
@@ -496,11 +603,11 @@ where
 }
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for Set<'a, T> {
-    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
-        Self {
-            raw: RawList::load(src, base_bit, layout),
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
+        Ok(Self {
+            raw: RawList::load_validated::<T>(src, base_bit, layout)?,
             _marker: PhantomData,
-        }
+        })
     }
 
     fn empty(src: Source<'a>) -> Self {
@@ -515,7 +622,7 @@ impl<'a, T: FromRaw<'a>> FromRaw<'a> for Set<'a, T> {
 impl<'a, T: FromRaw<'a>> Set<'a, T> {
     /// The number of elements in this set.
     pub fn len(&self) -> usize {
-        self.raw.len as _
+        self.raw.len()
     }
 
     /// Return `true` if this set contains no elements.
