@@ -50,16 +50,16 @@ macro_rules! define_value_struct {
             }
 
             impl<$a> FromRaw<$a> for $name<$a> {
-                fn load(src: &Source<$a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+                fn load(src: Source<$a>, base_bit: u64, layout: &SchemaLayout) -> Self {
                     Self {
                         $($field: src.load_field(base_bit, layout, $field_id),)*
                         _marker: PhantomData,
                     }
                 }
 
-                fn from_empty(src: &Source<$a>) -> Self {
+                fn empty(src: Source<$a>) -> Self {
                     Self {
-                        $($field: FromRaw::from_empty(src),)*
+                        $($field: FromRaw::empty(src),)*
                         _marker: PhantomData,
                     }
                 }
