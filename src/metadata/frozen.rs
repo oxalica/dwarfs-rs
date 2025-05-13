@@ -150,7 +150,6 @@ pub(crate) type Str<'a> = &'a BStr;
 impl<'a> FromRaw<'a> for Str<'a> {
     fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
         let (distance, count): (u64, u64) = src.load(base_bit, layout);
-        // dbg!(base_bit);
         let bytes = &src.bytes[distance as usize..][..count as usize];
         BStr::new(bytes)
     }
@@ -168,17 +167,11 @@ struct RawList<'a> {
     elem_bits: u16,
 }
 
-impl fmt::Debug for RawList<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RawList")
-            .field("len", &self.len)
-            .field("elem_bits", &self.elem_bits)
-            .finish_non_exhaustive()
-    }
-}
-
 impl<'a> RawList<'a> {
     fn at<T: FromRaw<'a>>(&self, idx: usize) -> T {
+        if self.elem_bits == 0 {
+            return T::empty(self.elem_src);
+        }
         let base_bit = idx as u64 * self.elem_bits as u64;
         let layout = &self.elem_src.schema[self.elem_layout_id];
         self.elem_src.load(base_bit, layout)
@@ -193,7 +186,10 @@ impl<'a> FromRaw<'a> for RawList<'a> {
         Self {
             elem_src: src.rebase(distance),
             len: count,
-            // For empty list, this field is unused anyway.
+            // Layout field is `None` if:
+            // - The list is empty, then it is unused anyway.
+            // - The list element type consists of zero bits, that is, all elements are 0.
+            //   This case is special cased in `RawList::at` and this field is unused.
             elem_layout_id: elem_layout.unwrap_or(!0),
             elem_bits,
         }
@@ -230,12 +226,15 @@ where
     T: fmt::Debug + FromRaw<'a>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("List")
-            .field("len", &self.raw.len)
-            // .field("base_byte", &self.raw.base_byte)
-            .field("elem_layout_id", &self.raw.elem_layout_id)
-            .field("elem_bits", &self.raw.elem_bits)
-            .finish_non_exhaustive()
+        let alt = f.alternate();
+        let mut d = f.debug_struct("List");
+        d.field("len", &self.raw.len)
+            .field("elem_bits", &self.raw.elem_bits);
+        if alt {
+            d.field("elems", &self.into_iter()).finish()
+        } else {
+            d.finish_non_exhaustive()
+        }
     }
 }
 
@@ -336,12 +335,15 @@ where
     V: fmt::Debug + FromRaw<'a>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let alt = f.alternate();
         let mut d = f.debug_struct("Map");
         d.field("len", &self.raw.len)
-            // .field("base_byte", &self.raw.base_byte)
-            .field("elem_layout_id", &self.raw.elem_layout_id)
-            .field("elem_bits", &self.raw.elem_bits)
-            .finish_non_exhaustive()
+            .field("elem_bits", &self.raw.elem_bits);
+        if alt {
+            d.field("entries", &self.into_iter()).finish()
+        } else {
+            d.finish_non_exhaustive()
+        }
     }
 }
 
@@ -401,7 +403,7 @@ where
     V: fmt::Debug + FromRaw<'a>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
+        f.debug_map().entries(self.clone()).finish()
     }
 }
 
