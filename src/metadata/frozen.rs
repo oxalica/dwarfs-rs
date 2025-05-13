@@ -20,9 +20,15 @@ use bstr::BStr;
 
 use crate::metadata::schema::{Schema, SchemaLayout};
 
+/// The offset type we use to index into metadata bytes.
+///
+/// We expect metadata to be relatively small comparing to the actual data and
+/// it's efficiently bit-packed. Assume 4GiB is enough for it.
+pub(crate) type Offset = u32;
+
 /// Parsable types.
 pub(crate) trait FromRaw<'a>: Sized {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self;
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self;
     fn empty(src: Source<'a>) -> Self;
 }
 
@@ -48,40 +54,40 @@ impl<'a> Source<'a> {
     // based on the new base location.
     // For structs, the base location is unchanged when iterating fields and
     // only bit offset is advanced.
-    fn rebase(self, distance: u64) -> Self {
+    fn rebase(self, distance: Offset) -> Self {
         Self {
             schema: self.schema,
             bytes: &self.bytes[distance as usize..],
         }
     }
 
-    fn load_bits(&self, mut base: u64, bits: u16) -> u64 {
+    fn load_bits(&self, mut base_bit: Offset, bits: u16) -> u64 {
         debug_assert!(bits <= 64);
 
         // FIXME: Optimize this.
         let mut ret = 0u64;
         for i in 0..bits {
-            let bit = (self.bytes[base as usize / 8] >> (base % 8)) & 1;
+            let bit = (self.bytes[base_bit as usize / 8] >> (base_bit % 8)) & 1;
             ret |= (bit as u64) << i;
-            base += 1;
+            base_bit += 1;
         }
         ret
     }
 
-    pub(crate) fn load<T: FromRaw<'a>>(self, base_bit: u64, layout: &SchemaLayout) -> T {
+    pub(crate) fn load<T: FromRaw<'a>>(self, base_bit: Offset, layout: &SchemaLayout) -> T {
         FromRaw::load(self, base_bit, layout)
     }
 
     pub(crate) fn load_field<T: FromRaw<'a>>(
         self,
-        mut base_bit: u64,
+        mut base_bit: Offset,
         layout: &SchemaLayout,
         field_id: u16,
     ) -> T {
         let Some(f) = layout.field(field_id) else {
             return T::empty(self);
         };
-        base_bit += f.offset_bits();
+        base_bit += f.offset_bits() as Offset;
         let layout = &self.schema[f.layout_id];
         self.load(base_bit, layout)
     }
@@ -90,7 +96,7 @@ impl<'a> Source<'a> {
 macro_rules! impl_int_from_raw {
     ($($i:tt),* $(,)?) => {
         $(impl<'a> FromRaw<'a> for $i {
-            fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
                 // TODO: Error handling.
                 assert!(layout.fields.is_empty());
                 let v = src.load_bits(base_bit, layout.bits);
@@ -106,7 +112,7 @@ macro_rules! impl_int_from_raw {
 impl_int_from_raw!(u8, u16, u32, u64);
 
 impl<'a> FromRaw<'a> for bool {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
         // TODO: This can be more efficient.
         u8::load(src, base_bit, layout) != 0
     }
@@ -118,7 +124,7 @@ impl<'a> FromRaw<'a> for bool {
 macro_rules! impl_tuple_from_raw {
     ($($ty:ident $idx:literal),*) => {
         impl<'a, $($ty: FromRaw<'a>),*> FromRaw<'a> for ($($ty,)*) {
-            fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+            fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
                 ($(src.load_field(base_bit, layout, $idx),)*)
             }
             fn empty(src: Source<'a>) -> Self {
@@ -133,7 +139,7 @@ impl_tuple_from_raw!(A 1, B 2);
 impl_tuple_from_raw!(A 1, B 2, C 3);
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for Option<T> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
         if src.load_field::<bool>(base_bit, layout, 1) {
             Some(src.load_field(base_bit, layout, 2))
         } else {
@@ -149,8 +155,8 @@ impl<'a, T: FromRaw<'a>> FromRaw<'a> for Option<T> {
 pub(crate) type Str<'a> = &'a BStr;
 
 impl<'a> FromRaw<'a> for Str<'a> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
-        let (distance, count): (u64, u64) = src.load(base_bit, layout);
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
+        let (distance, count): (Offset, Offset) = src.load(base_bit, layout);
         let bytes = &src.bytes[distance as usize..][..count as usize];
         BStr::new(bytes)
     }
@@ -163,7 +169,7 @@ impl<'a> FromRaw<'a> for Str<'a> {
 struct RawList<'a> {
     /// The rebased location for element storage.
     elem_src: Source<'a>,
-    len: u64,
+    len: Offset,
     elem_layout_id: u16,
     elem_bits: u16,
 }
@@ -173,15 +179,15 @@ impl<'a> RawList<'a> {
         if self.elem_bits == 0 {
             return T::empty(self.elem_src);
         }
-        let base_bit = idx as u64 * self.elem_bits as u64;
+        let base_bit = idx as Offset * Offset::from(self.elem_bits);
         let layout = &self.elem_src.schema[self.elem_layout_id];
         self.elem_src.load(base_bit, layout)
     }
 }
 
 impl<'a> FromRaw<'a> for RawList<'a> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
-        let (distance, count): (u64, u64) = src.load(base_bit, layout);
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
+        let (distance, count): (Offset, Offset) = src.load(base_bit, layout);
         let elem_layout = layout.field(3).map(|f| f.layout_id);
         let elem_bits = elem_layout.map_or(0, |lid| src.schema[lid].bits);
         Self {
@@ -240,7 +246,7 @@ where
 }
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for List<'a, T> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
         Self {
             raw: RawList::load(src, base_bit, layout),
             _marker: PhantomData,
@@ -349,7 +355,7 @@ where
 }
 
 impl<'a, K: FromRaw<'a>, V: FromRaw<'a>> FromRaw<'a> for Map<'a, K, V> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
         Self {
             raw: src.load(base_bit, layout),
             _marker: PhantomData,
@@ -490,7 +496,7 @@ where
 }
 
 impl<'a, T: FromRaw<'a>> FromRaw<'a> for Set<'a, T> {
-    fn load(src: Source<'a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+    fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
         Self {
             raw: RawList::load(src, base_bit, layout),
             _marker: PhantomData,

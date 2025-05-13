@@ -1,7 +1,7 @@
 //! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
 use std::{fmt, marker::PhantomData};
 
-use self::frozen::{FromRaw, Source, Str};
+use self::frozen::{FromRaw, Offset, Source, Str};
 use self::schema::SchemaLayout;
 use crate::{Error, Result};
 
@@ -50,7 +50,7 @@ macro_rules! define_value_struct {
             }
 
             impl<$a> FromRaw<$a> for $name<$a> {
-                fn load(src: Source<$a>, base_bit: u64, layout: &SchemaLayout) -> Self {
+                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Self {
                     Self {
                         $($field: src.load_field(base_bit, layout, $field_id),)*
                         _marker: PhantomData,
