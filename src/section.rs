@@ -7,10 +7,9 @@ use std::{
 use xxhash_rust::xxh3::Xxh3Default;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as le};
 
-type Result<T> = std::result::Result<T, Error>;
+use crate::DWARFS_VERSION;
 
-/// The (major, minor) version this library supports.
-pub const DWARFS_VERSION: (u8, u8) = (2, 5);
+type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -273,6 +272,13 @@ impl<R: Read + ?Sized> SectionReader<R> {
         R: Sized,
     {
         self.rdr
+    }
+
+    /// Read a section.
+    pub fn read_section(&mut self) -> Result<(Header, Vec<u8>)> {
+        let header = self.read_header()?;
+        let data = self.read_data(&header)?;
+        Ok((header, data))
     }
 
     /// Read a section header.
