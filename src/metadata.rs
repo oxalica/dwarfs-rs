@@ -6,6 +6,7 @@ use self::schema::SchemaLayout;
 
 mod frozen;
 mod schema;
+pub mod unpacked;
 
 pub use frozen::{Error as MetadataError, List, ListIter, Map, MapIter, Set, SetIter};
 pub use schema::OpaqueError as SchemaError;
