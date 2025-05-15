@@ -1,3 +1,4 @@
+pub mod fsst;
 pub mod metadata;
 pub mod section;
 
