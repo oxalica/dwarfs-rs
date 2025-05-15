@@ -14,7 +14,7 @@ type List<T> = Vec<T>;
 type Set<T> = BTreeSet<T>;
 type Map<K, V> = BTreeMap<K, V>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metadata {
     pub chunks: List<Chunk>,
     pub directories: List<Directory>,
@@ -50,21 +50,21 @@ pub struct Metadata {
     pub reg_file_size_cache: Option<InodeSizeCache>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Chunk {
     pub block: u32,
     pub offset: u32,
     pub size: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Directory {
     pub parent_entry: u32,
     pub first_entry: u32,
     pub self_entry: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct InodeData {
     pub mode_index: u32,
     pub owner_index: u32,
@@ -79,13 +79,13 @@ pub struct InodeData {
     pub inode: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name_index: u32,
     pub inode_num: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FsOptions {
     pub mtime_only: bool,
     pub time_resolution_sec: Option<u32>,
@@ -94,7 +94,7 @@ pub struct FsOptions {
     pub packed_shared_files_table: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StringTable {
     pub buffer: Str,
     pub symtab: Option<Str>,
@@ -102,7 +102,7 @@ pub struct StringTable {
     pub packed_index: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 
 pub struct InodeSizeCache {
     pub lookup: Map<u32, u64>,
