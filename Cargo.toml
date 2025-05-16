@@ -22,3 +22,9 @@ zstd = { version = "0.13.3", optional = true }
 
 [lints.clippy]
 dbg-macro = "warn"
+
+[workspace]
+members = ["dwarfs-test"]
+
+[profile.bench]
+debug = "line-tables-only"
