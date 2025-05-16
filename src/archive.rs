@@ -331,6 +331,7 @@ impl ArchiveIndex {
             tbl: &mut Option<unpacked::StringTable>,
             msg_index: &'static str,
             msg_symtab: &'static str,
+            msg_decode: &'static str,
         ) -> Result<()> {
             let Some(tbl) = tbl else { return Ok(()) };
             let len = tbl.buffer.len() as u32;
@@ -344,12 +345,18 @@ impl ArchiveIndex {
                     *v = sum;
                 }
             } else {
-                for &v in &tbl.index {
-                    (v <= len).or_context(msg_index)?;
+                tbl.index.is_sorted().or_context(msg_index)?;
+                if let Some(last_idx) = tbl.index.last() {
+                    (*last_idx <= len).or_context(msg_index)?;
                 }
             }
             if let Some(symtab_bytes) = &tbl.symtab {
                 let decoder = Decoder::parse_symtab(symtab_bytes).context(msg_symtab)?;
+                for &i in &tbl.index {
+                    if i != 0 {
+                        (tbl.buffer[i as usize - 1] != 0xFF).or_context(msg_decode)?;
+                    }
+                }
                 *out = Some(Box::new(decoder));
             }
             Ok(())
@@ -360,8 +367,9 @@ impl ArchiveIndex {
         unpack_string_table(
             &mut self.name_table_decoder,
             &mut m.compact_names,
-            "index out of range for compact_names.index",
+            "invalid index for compact_names.index",
             "failed to parse compact_names.symtab",
+            "failed to decode compact_names.buffer using symtab",
         )?;
 
         (m.compact_symlinks.is_none() || m.symlinks.is_empty())
@@ -369,8 +377,9 @@ impl ArchiveIndex {
         unpack_string_table(
             &mut self.symlink_table_decoder,
             &mut m.compact_symlinks,
-            "index out of range for compact_symlinks.index",
+            "invalid index for compact_symlinks.index",
             "failed to parse compact_symlinks.symtab",
+            "failed to decode compact_symlinks.buffer using symtab",
         )?;
 
         // Validate contents, mostly about indexes.
@@ -815,9 +824,10 @@ impl<'a> DirEntry<'a> {
         Self { index, data }
     }
 
-    // FIXME: This should not fail.
-    pub fn name(&self) -> Option<BString> {
-        self.index.get_name_by_index(self.data.name_index)
+    pub fn name(&self) -> BString {
+        self.index
+            .get_name_by_index(self.data.name_index)
+            .expect("validated")
     }
 
     pub fn inode(&self) -> Inode<'a> {
@@ -845,10 +855,11 @@ impl<'a> From<Symlink<'a>> for Inode<'a> {
 }
 
 impl Symlink<'_> {
-    // FIXME: This should not fail.
-    pub fn target(&self) -> Option<BString> {
+    pub fn target(&self) -> BString {
         let tgt_idx = self.index.metadata().symlink_table[self.symlink_idx as usize];
-        self.index.get_symlink_target_by_index(tgt_idx)
+        self.index
+            .get_symlink_target_by_index(tgt_idx)
+            .expect("validated")
     }
 }
 
