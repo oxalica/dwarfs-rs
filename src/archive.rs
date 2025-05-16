@@ -628,10 +628,10 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
         }
     }
 
-    fn get_cache(&self) -> &[u8] {
+    fn get_cache(&self) -> (u64, &[u8]) {
         match &self.cache {
-            Some((_, cache)) => cache,
-            None => &[],
+            Some((archive_offset, cache)) => (*archive_offset, cache),
+            None => (!0, &[]),
         }
     }
 
@@ -1294,8 +1294,24 @@ impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
                 self.chunks.index.section_index[chunk.section_idx() as usize].offset();
             self.archive.cache_section(archive_offset)?;
         }
-        let cache = self.archive.get_cache();
-        Ok(&cache[self.in_section_offset as usize..][..self.chunk_rest_size as usize])
+
+        let (archive_offset, cache) = self.archive.get_cache();
+        let start = self.in_section_offset as usize;
+        let end = start + self.chunk_rest_size as usize;
+        cache.get(start..end).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid section data at archive offset {} + image offset {}, \
+                    expecting a chunk at {}..{}, but decompressed data length is {}",
+                    archive_offset,
+                    self.archive.image_offset,
+                    start,
+                    end,
+                    cache.len(),
+                ),
+            )
+        })
     }
 
     fn consume(&mut self, amt: usize) {
