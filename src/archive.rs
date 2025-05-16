@@ -205,7 +205,7 @@ impl fmt::Debug for ArchiveIndex {
 #[derive(Debug, Default)]
 struct InodeTally {
     /// The number of unique files.
-    unique_files: u32,
+    unique_cnt: u32,
 
     // ..directories..
     symlink_start: u32,
@@ -384,7 +384,7 @@ impl ArchiveIndex {
             (ipc_start <= inode_cnt).or_context("inodes table too short")?;
 
             self.inode_tally = InodeTally {
-                unique_files: 0,
+                unique_cnt,
                 symlink_start: dir_cnt as u32,
                 unique_start: unique_start as u32,
                 shared_start: shared_start as u32,
@@ -1136,7 +1136,7 @@ impl DoubleEndedIterator for ChunkIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.chunk_start < self.chunk_end {
             let c = Chunk::new(self.index, self.chunk_end - 1);
-            self.chunk_end += 1;
+            self.chunk_end -= 1;
             Some(c)
         } else {
             None
@@ -1167,7 +1167,7 @@ impl sealed::Sealed for SharedFile<'_> {}
 impl<'a> AsChunks<'a> for SharedFile<'a> {
     fn as_chunks(&self) -> ChunkIter<'a> {
         let m = self.index.metadata();
-        let file_idx = self.index.inode_tally.unique_files
+        let file_idx = self.index.inode_tally.unique_cnt
             + m.shared_files_table.as_ref().expect("validated")[self.shared_idx as usize];
         let chunk_start = m.chunk_table[file_idx as usize];
         let chunk_end = m.chunk_table[file_idx as usize + 1];
