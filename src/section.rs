@@ -359,14 +359,40 @@ impl<R: Read + ?Sized> SectionReader<R> {
 
         match header.compress_algo {
             CompressAlgo::NONE => Ok(compressed),
+            #[cfg(feature = "zstd")]
             CompressAlgo::ZSTD => {
                 let mut out = vec![0u8; data_size_limit];
                 let len = zstd::bulk::decompress_to_buffer(&compressed, &mut out)?;
-                debug_assert!(len <= out.len());
                 out.truncate(len);
                 Ok(out)
             }
-            // TODO: More algorithms.
+            #[cfg(feature = "lzma")]
+            CompressAlgo::LZMA => {
+                let mut out = vec![0u8; data_size_limit];
+                (|| {
+                    let mut stream = xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
+                    let st = stream.process(&compressed, &mut out, xz2::stream::Action::Run)?;
+                    if stream.total_in() as usize != compressed.len()
+                        || st != xz2::stream::Status::StreamEnd
+                    {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "LZMA stream did not end cleanly",
+                        ));
+                    }
+                    out.truncate(stream.total_out() as usize);
+                    Ok(())
+                })()?;
+                Ok(out)
+            }
+            #[cfg(feature = "lz4")]
+            CompressAlgo::LZ4 | CompressAlgo::LZ4HC => {
+                let mut out = vec![0u8; data_size_limit];
+                let len = lz4::block::decompress_to_buffer(&compressed, None, &mut out)?;
+                out.truncate(len);
+                Ok(out)
+            }
+            // Not supported: FLAC (overlay specific), RICEPP (no much information or library).
             algo => Err(Error::UnknowCompressAlgo(algo)),
         }
     }

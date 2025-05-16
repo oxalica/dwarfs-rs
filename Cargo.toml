@@ -5,12 +5,20 @@ edition = "2024"
 description = "WIP"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+lzma = ["dep:xz2"]
+lz4 = ["dep:lz4"]
+
 [dependencies]
 bstr = "1.12.0"
+lz4 = { version = "1.28.1", optional = true }
 sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+xz2 = { version = "0.1.7", optional = true }
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
-zstd = "0.13.3"
+zstd = { version = "0.13.3", optional = true }
 
 [lints.clippy]
 dbg-macro = "warn"
