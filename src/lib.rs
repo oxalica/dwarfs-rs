@@ -3,8 +3,11 @@ pub mod fsst;
 pub mod metadata;
 pub mod section;
 
-/// The (major, minor) version this library supports.
-pub const DWARFS_VERSION: (u8, u8) = (2, 5);
+/// The (included) minimum (major, minor) version this library supports.
+pub const DWARFS_VERSION_MIN: (u8, u8) = (2, 5);
+
+/// The (included) maximum (major, minor) version this library supports.
+pub const DWARFS_VERSION_MAX: (u8, u8) = (2, 5);
 
 use std::{cmp::Ordering, ops::Range};
 

@@ -310,6 +310,16 @@ impl ArchiveIndex {
                 .checked_mul(self.time_resolution.get().into())
                 .context("timestamp_base overflow")?;
 
+            if opts.packed_chunk_table {
+                let mut sum = 0u32;
+                for c in &mut m.chunk_table {
+                    sum = c
+                        .checked_add(sum)
+                        .context("value overflow for packed chunk_table")?;
+                    *c = sum;
+                }
+            }
+
             if opts.packed_directories {
                 let mut sum = 0u32;
                 for dir in &mut m.directories {
@@ -320,8 +330,24 @@ impl ArchiveIndex {
                 }
             }
 
-            if opts.packed_shared_files_table {
-                todo!()
+            if let Some(shared) = m
+                .shared_files_table
+                .as_ref()
+                .filter(|_| opts.packed_shared_files_table)
+            {
+                let unpacked_len = std::iter::zip(shared, 2..)
+                    .try_fold(0u32, |sum, (&cnt, dups)| {
+                        cnt.checked_mul(dups)?.checked_add(sum)
+                    })
+                    // Use inode count as a loose upper bound, to guard from length exploding.
+                    .filter(|&n| n < m.inodes.len() as u32)
+                    .context("loosy this")?;
+                let mut unpacked = Vec::with_capacity(unpacked_len as usize);
+                unpacked.extend(
+                    std::iter::zip(shared, 2usize..)
+                        .flat_map(|(&cnt, dups)| std::iter::repeat_n(cnt, dups)),
+                );
+                m.shared_files_table = Some(unpacked);
             }
         }
 
@@ -555,7 +581,7 @@ impl ArchiveIndex {
     ///
     /// # fn work() -> Option<()> {
     /// let index: ArchiveIndex;
-    /// # index = todo!();
+    /// # index = unimplemented!();
     /// // These two statements are equivalent.
     /// let baz1: Inode<'_> = index.get_path("src/lib.rs".split('/'))?;
     /// let baz2: Inode<'_> = index.root().get("src")?.inode().as_dir()?.get("lib.rs")?.inode();

@@ -7,8 +7,6 @@ use std::{
 use xxhash_rust::xxh3::Xxh3Default;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as le};
 
-use crate::DWARFS_VERSION;
-
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
@@ -181,9 +179,10 @@ impl MagicVersion {
 
     /// Validate if the magic matches and the format version is compatible with this library.
     pub fn validate(self) -> Result<()> {
+        let ver = (self.major, self.minor);
         if self.magic == Self::MAGIC
-            && self.major == DWARFS_VERSION.0
-            && self.minor <= DWARFS_VERSION.1
+            && crate::DWARFS_VERSION_MIN <= ver
+            && ver <= crate::DWARFS_VERSION_MAX
         {
             Ok(())
         } else {
