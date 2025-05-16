@@ -10,6 +10,7 @@ use std::{
 use bstr::{BStr, BString, ByteSlice};
 
 use crate::{
+    bisect_range_by,
     fsst::Decoder as FsstDecoder,
     metadata::{Metadata, MetadataError, Schema, SchemaError, unpacked},
     section::{SectionIndexEntry, SectionReader, SectionType},
@@ -492,6 +493,41 @@ impl ArchiveIndex {
         }
     }
 
+    /// Get the root directory of the archive.
+    pub fn root(&self) -> Dir<'_> {
+        Dir {
+            index: self,
+            inode_num: 0,
+        }
+    }
+
+    /// Get the inode under the given path from the root directory of the archive.
+    ///
+    /// ```
+    /// use dwarfs::{ArchiveIndex, Inode};
+    ///
+    /// # fn work() -> Option<()> {
+    /// let index: ArchiveIndex;
+    /// # index = todo!();
+    /// // These two statements are equivalent.
+    /// let baz1: Inode<'_> = index.get_path("src/lib.rs".split('/'))?;
+    /// let baz2: Inode<'_> = index.root().get("src")?.inode().as_dir()?.get("lib.rs")?.inode();
+    /// # None }
+    /// ```
+    pub fn get_path<I>(&self, path: I) -> Option<Inode<'_>>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        path.into_iter()
+            .try_fold(Inode::from(self.root()), |inode, name| {
+                Some(inode.as_dir()?.get(name)?.inode())
+            })
+    }
+}
+
+/// Low-level methods.
+impl ArchiveIndex {
     pub fn section_index(&self) -> &[SectionIndexEntry] {
         &self.section_index
     }
@@ -500,11 +536,11 @@ impl ArchiveIndex {
         &self.metadata
     }
 
-    pub fn root(&self) -> Dir<'_> {
-        Dir {
+    pub fn get_inode(&self, inode_num: u32) -> Option<Inode<'_>> {
+        (inode_num < self.metadata().inodes.len() as u32).then_some(Inode {
             index: self,
-            inode_num: 0,
-        }
+            inode_num,
+        })
     }
 }
 
@@ -517,23 +553,6 @@ pub struct Archive<R: ?Sized> {
     rdr: SectionReader<R>,
 }
 
-impl<R: ?Sized> Archive<R> {
-    pub fn into_inner(self) -> R
-    where
-        R: Sized,
-    {
-        self.rdr.into_inner()
-    }
-
-    pub fn get_ref(&self) -> &R {
-        self.rdr.get_ref()
-    }
-
-    pub fn get_mut(&mut self) -> &mut R {
-        self.rdr.get_mut()
-    }
-}
-
 impl<R: Read + Seek + ?Sized> Archive<R> {
     pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)>
     where
@@ -541,12 +560,19 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
     {
         let mut rdr = SectionReader::new(rdr);
         let index = ArchiveIndex::new(&mut rdr)?;
-        let this = Self {
+        let this = Self::new_with_index(rdr, &index);
+        Ok((index, this))
+    }
+
+    pub fn new_with_index(rdr: SectionReader<R>, index: &ArchiveIndex) -> Self
+    where
+        R: Sized,
+    {
+        Self {
             cache: None,
             block_size: index.metadata().block_size,
             rdr,
-        };
-        Ok((index, this))
+        }
     }
 
     fn get_cache(&self) -> &[u8] {
@@ -577,6 +603,23 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
         ))?;
         self.cache = Some((file_offset, data));
         Ok(())
+    }
+}
+
+impl<R> Archive<R> {
+    pub fn into_inner(self) -> R
+    where
+        R: Sized,
+    {
+        self.rdr.into_inner()
+    }
+
+    pub fn get_ref(&self) -> &R {
+        self.rdr.get_ref()
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        self.rdr.get_mut()
     }
 }
 
@@ -752,6 +795,7 @@ impl<'a> From<Dir<'a>> for Inode<'a> {
 }
 
 impl<'a> Dir<'a> {
+    /// Iterate all entries in this directory, in ascending order of names.
     pub fn entries(&self) -> DirEntryIter<'a> {
         let ino = self.inode_num as usize;
         let dirs = &self.index.metadata().directories;
@@ -760,6 +804,25 @@ impl<'a> Dir<'a> {
             ent_start: dirs[ino].first_entry,
             ent_end: dirs[ino + 1].first_entry,
         }
+    }
+
+    /// Find the entry of given name in this directory.
+    ///
+    /// In dwarfs, directory entries are listed in ascending order of names.
+    /// So `get` performs a binary search and the time complexity is
+    /// `O(min(L, L0) log N)` where `L` is the max length of entry names, `L0`
+    /// is the `name.len()` and `N` is the number of entries in this directory.
+    pub fn get(&self, name: impl AsRef<[u8]>) -> Option<DirEntry<'a>> {
+        self.get_inner(name.as_ref())
+    }
+
+    fn get_inner(&self, name: &[u8]) -> Option<DirEntry<'a>> {
+        let iter = self.entries();
+        let range = iter.ent_start as usize..iter.ent_end as usize;
+        let idx = bisect_range_by(range, |idx| {
+            <[u8] as Ord>::cmp(DirEntry::new(self.index, idx as u32).name(), name)
+        })?;
+        Some(DirEntry::new(self.index, idx as u32))
     }
 }
 

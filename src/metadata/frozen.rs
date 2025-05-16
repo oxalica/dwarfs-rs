@@ -14,11 +14,14 @@
 //! - Me (oxalica) reverse engineering bytes layouts in dwarfs metadata block, and
 //!   comparing with the metadata dump from:
 //!   `dwarfsck $imgfile -d metadata_full_dump`
-use std::{borrow::Borrow, cmp::Ordering, fmt, marker::PhantomData, ops::Range};
+use std::{borrow::Borrow, fmt, marker::PhantomData};
 
 use bstr::BStr;
 
-use crate::metadata::schema::{Schema, SchemaLayout};
+use crate::{
+    bisect_range_by,
+    metadata::schema::{Schema, SchemaLayout},
+};
 
 /// The offset type we use to index into metadata bytes.
 ///
@@ -735,38 +738,5 @@ impl<'a, T: FromRaw<'a>> Iterator for SetIter<'a, T> {
         } else {
             None
         }
-    }
-}
-
-/// There is currently no binary search functions in std over a generic range.
-/// This is copied from std: <https://github.com/rust-lang/rust/blob/1.86.0/library/core/src/slice/mod.rs#L2817>
-/// License: MIT OR Apache-2.0
-pub fn bisect_range_by<F>(range: Range<usize>, mut f: F) -> Option<usize>
-where
-    F: FnMut(usize) -> Ordering,
-{
-    let total_size = range.end - range.start;
-    let mut size = total_size;
-    if size == 0 {
-        return None;
-    }
-    let mut base = 0usize;
-
-    while size > 1 {
-        let half = size / 2;
-        let mid = base + half;
-        let cmp = f(mid);
-        // WAIT: Rust 1.88
-        // base = (cmp == Ordering::Greater).select_unpredictable(base, mid);
-        base = if cmp == Ordering::Greater { base } else { mid };
-        size -= half;
-    }
-
-    let cmp = f(base);
-    if cmp == Ordering::Equal {
-        debug_assert!(base < total_size);
-        Some(base)
-    } else {
-        None
     }
 }
