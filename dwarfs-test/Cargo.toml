@@ -8,3 +8,4 @@ publish = false
 clap = { version = "4.5.38", features = ["derive"] }
 colored-diff = "0.2.3"
 dwarfs.path = ".."
+tempfile = "3.20.0"
