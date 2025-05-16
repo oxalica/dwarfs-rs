@@ -7,10 +7,10 @@ use std::{
     num::NonZero,
 };
 
-use bstr::BString;
+use bstr::{BStr, BString, ByteSlice};
 
 use crate::{
-    fsst::Decoder,
+    fsst::Decoder as FsstDecoder,
     metadata::{Metadata, MetadataError, Schema, SchemaError, unpacked},
     section::{SectionIndexEntry, SectionReader, SectionType},
 };
@@ -146,8 +146,6 @@ pub struct ArchiveIndex {
     mtime_only: bool,
     time_resolution: NonZero<u32>,
     timestamp_base_scaled: u64,
-    name_table_decoder: Option<Box<Decoder>>,
-    symlink_table_decoder: Option<Box<Decoder>>,
     inode_tally: InodeTally,
 }
 
@@ -160,8 +158,6 @@ impl fmt::Debug for ArchiveIndex {
             d.field("mtime_only", &self.mtime_only)
                 .field("time_resolution", &self.time_resolution)
                 .field("timestamp_base_scaled", &self.timestamp_base_scaled)
-                .field("name_table_decoder", &self.name_table_decoder)
-                .field("symlink_table_decoder", &self.symlink_table_decoder)
                 .field("inode_tally", &self.inode_tally);
         }
         d.finish_non_exhaustive()
@@ -232,20 +228,18 @@ impl ArchiveIndex {
         let mut this = Self {
             section_index,
             metadata,
-            name_table_decoder: None,
-            symlink_table_decoder: None,
 
             mtime_only: false,
             time_resolution: NonZero::new(1).expect("1 is non-zero"),
             timestamp_base_scaled: 0,
             inode_tally: Default::default(),
         };
-        this.validate_post()?;
+        this.unpack_validate()?;
         Ok(this)
     }
 
     /// Guard on filesystem features, unpack packed fields, build decoders and validate index ranges.
-    fn validate_post(&mut self) -> Result<()> {
+    fn unpack_validate(&mut self) -> Result<()> {
         let m = &mut self.metadata;
 
         // Explicit future-incompatible features.
@@ -327,7 +321,6 @@ impl ArchiveIndex {
 
         // Unpack string tables, currently `compact_{names,symlinks}`.
         fn unpack_string_table(
-            out: &mut Option<Box<Decoder>>,
             tbl: &mut Option<unpacked::StringTable>,
             msg_index: &'static str,
             msg_symtab: &'static str,
@@ -344,20 +337,43 @@ impl ArchiveIndex {
                         .context(msg_index)?;
                     *v = sum;
                 }
-            } else {
+            // If symtab is used, the decoding process below will validate index ranges anyway.
+            } else if tbl.symtab.is_none() {
                 tbl.index.is_sorted().or_context(msg_index)?;
                 if let Some(last_idx) = tbl.index.last() {
                     (*last_idx <= len).or_context(msg_index)?;
                 }
             }
             if let Some(symtab_bytes) = &tbl.symtab {
-                let decoder = Decoder::parse_symtab(symtab_bytes).context(msg_symtab)?;
-                for &i in &tbl.index {
-                    if i != 0 {
-                        (tbl.buffer[i as usize - 1] != 0xFF).or_context(msg_decode)?;
-                    }
+                let decoder = FsstDecoder::parse_symtab(symtab_bytes).context(msg_symtab)?;
+                let encoded = &tbl.buffer[..];
+                // The decoded length must be greater than encoded length to
+                // worth it, so 1x is not enough. Pick 2x as the least bound here.
+                // Also note that `isize::MAX as usize * 2` never overflows.
+                let mut out_buf = Vec::with_capacity(encoded.len() * 2);
+                let mut out_index = Vec::with_capacity(tbl.index.len());
+                let mut out_len = 0usize;
+                out_index.push(0);
+                for w in tbl.index.windows(2) {
+                    let sym = encoded
+                        .get(w[0] as usize..w[1] as usize)
+                        .context(msg_index)?;
+                    let sym_dec_len = FsstDecoder::max_decode_len(sym.len());
+                    out_buf.resize(out_len + sym_dec_len, 0);
+                    let sym_out = &mut out_buf[out_len..out_len + sym_dec_len];
+                    out_len += decoder.decode_into(sym, sym_out).context(msg_decode)?;
+
+                    // This is suboptimal, because it *is* possible that the total length of
+                    // decoded strings overflows u32, that is 4GiB names compressed into 512MiB.
+                    // I don't think it's practically viable without exceeding the whole metadata
+                    // size limit. Emitting a decoding error in this case seems acceptable to me.
+                    let pos = u32::try_from(out_len).ok().context(msg_decode)?;
+                    out_index.push(pos);
                 }
-                *out = Some(Box::new(decoder));
+                debug_assert_eq!(out_index.len(), tbl.index.len());
+                out_buf.truncate(out_len);
+                tbl.buffer = out_buf.into();
+                tbl.index = out_index;
             }
             Ok(())
         }
@@ -365,7 +381,6 @@ impl ArchiveIndex {
         (m.compact_names.is_none() || m.names.is_empty())
             .or_context("names must be empty when compact_names is used")?;
         unpack_string_table(
-            &mut self.name_table_decoder,
             &mut m.compact_names,
             "invalid index for compact_names.index",
             "failed to parse compact_names.symtab",
@@ -375,7 +390,6 @@ impl ArchiveIndex {
         (m.compact_symlinks.is_none() || m.symlinks.is_empty())
             .or_context("symlinks must be empty when compact_symlinks is used")?;
         unpack_string_table(
-            &mut self.symlink_table_decoder,
             &mut m.compact_symlinks,
             "invalid index for compact_symlinks.index",
             "failed to parse compact_symlinks.symtab",
@@ -464,36 +478,17 @@ impl ArchiveIndex {
         Ok(())
     }
 
-    fn get_name_by_index(&self, name_idx: u32) -> Option<BString> {
-        let m = self.metadata();
-        if let Some(tbl) = &m.compact_names {
-            let idx_start = *tbl.index.get(name_idx as usize)? as usize;
-            let idx_end = *tbl.index.get(name_idx as usize + 1)? as usize;
-            let raw = tbl.buffer.get(idx_start..idx_end)?;
-            if let Some(dec) = &self.name_table_decoder {
-                dec.decode(raw)
-            } else {
-                Some(raw.to_vec().into())
-            }
+    fn get_from_string_table<'a>(
+        loose: &'a [BString],
+        compact: &'a Option<unpacked::StringTable>,
+        idx: u32,
+    ) -> &'a BStr {
+        if let Some(tbl) = compact {
+            let idx_start = tbl.index[idx as usize] as usize;
+            let idx_end = tbl.index[idx as usize + 1] as usize;
+            tbl.buffer[idx_start..idx_end].as_bstr()
         } else {
-            m.names.get(name_idx as usize).cloned()
-        }
-    }
-
-    // TODO: merge this and `get_name_by_index`?
-    fn get_symlink_target_by_index(&self, idx: u32) -> Option<BString> {
-        let m = self.metadata();
-        if let Some(tbl) = &m.compact_symlinks {
-            let idx_start = *tbl.index.get(idx as usize)? as usize;
-            let idx_end = *tbl.index.get(idx as usize)? as usize;
-            let raw = tbl.buffer.get(idx_start..idx_end)?;
-            if let Some(dec) = &self.symlink_table_decoder {
-                dec.decode(raw)
-            } else {
-                Some(raw.to_vec().into())
-            }
-        } else {
-            m.symlinks.get(idx as usize).cloned()
+            loose[idx as usize].as_bstr()
         }
     }
 
@@ -824,10 +819,9 @@ impl<'a> DirEntry<'a> {
         Self { index, data }
     }
 
-    pub fn name(&self) -> BString {
-        self.index
-            .get_name_by_index(self.data.name_index)
-            .expect("validated")
+    pub fn name(&self) -> &'a BStr {
+        let m = self.index.metadata();
+        ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, self.data.name_index)
     }
 
     pub fn inode(&self) -> Inode<'a> {
@@ -854,12 +848,11 @@ impl<'a> From<Symlink<'a>> for Inode<'a> {
     }
 }
 
-impl Symlink<'_> {
-    pub fn target(&self) -> BString {
-        let tgt_idx = self.index.metadata().symlink_table[self.symlink_idx as usize];
-        self.index
-            .get_symlink_target_by_index(tgt_idx)
-            .expect("validated")
+impl<'a> Symlink<'a> {
+    pub fn target(&self) -> &'a BStr {
+        let m = self.index.metadata();
+        let tgt_idx = m.symlink_table[self.symlink_idx as usize];
+        ArchiveIndex::get_from_string_table(&m.symlinks, &m.compact_symlinks, tgt_idx)
     }
 }
 
