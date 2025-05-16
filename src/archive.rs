@@ -2,7 +2,7 @@
 
 use std::{
     fmt,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, Read, Seek, SeekFrom},
     iter::FusedIterator,
     num::NonZero,
 };
@@ -15,13 +15,23 @@ use crate::{
     section::{SectionIndexEntry, SectionReader, SectionType},
 };
 
+// Some arbitrarily chosen numbers.
+// TODO: These should be configurable.
+const DEFAULT_SECTION_INDEX_SIZE_LIMIT: usize = 64 << 20;
+const DEFAULT_METADATA_SCHEMA_SIZE_LIMIT: usize = 1 << 20;
+const DEFAULT_METADATA_SIZE_LIMIT: usize = 16 << 20;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Error(Box<ErrorInner>);
 
+mod sealed {
+    pub trait Sealed {}
+}
+
 #[derive(Debug)]
 enum ErrorInner {
-    Section(&'static str, crate::section::Error),
+    Section(String, crate::section::Error),
     MissingSection(SectionType),
     DuplicatedSection(SectionType),
     Schema(SchemaError),
@@ -81,16 +91,23 @@ impl From<std::io::Error> for Error {
     }
 }
 
+// Needed for `Read` impl.
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+    }
+}
+
 trait ResultExt<T> {
-    fn context(self, msg: &'static str) -> Result<T>;
+    fn context(self, msg: impl fmt::Display) -> Result<T>;
 }
 
 impl<T> ResultExt<T> for Result<T, crate::section::Error> {
     #[inline]
-    fn context(self, msg: &'static str) -> Result<T> {
+    fn context(self, msg: impl fmt::Display) -> Result<T> {
         match self {
             Ok(v) => Ok(v),
-            Err(err) => Err(ErrorInner::Section(msg, err).into()),
+            Err(err) => Err(ErrorInner::Section(msg.to_string(), err).into()),
         }
     }
 }
@@ -171,11 +188,10 @@ struct InodeTally {
 }
 
 impl ArchiveIndex {
-    pub fn new<R: Read + Seek>(rdr: &mut R) -> Result<Self> {
+    pub fn new<R: Read + Seek>(rdr: &mut SectionReader<R>) -> Result<Self> {
         // Load section index.
-        let mut rdr = SectionReader::new(rdr);
         let (_, section_index) = rdr
-            .seek_read_section_index(0)
+            .seek_read_section_index(0, DEFAULT_SECTION_INDEX_SIZE_LIMIT)
             .context("failed to load section index")?;
         u32::try_from(section_index.len())
             .ok()
@@ -201,13 +217,13 @@ impl ArchiveIndex {
         let metadata = {
             rdr.get_mut().seek(SeekFrom::Start(schema_offset))?;
             let (_, raw_schema) = rdr
-                .read_section()
+                .read_section(DEFAULT_METADATA_SCHEMA_SIZE_LIMIT)
                 .context("failed to read metadata schema section")?;
             let schema = Schema::parse(&raw_schema).map_err(ErrorInner::Schema)?;
 
             rdr.get_mut().seek(SeekFrom::Start(metadata_offset))?;
             let (_, raw_metadata) = rdr
-                .read_section()
+                .read_section(DEFAULT_METADATA_SIZE_LIMIT)
                 .context("failed to read metadata section")?;
             let meta = Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::Metadata)?;
             unpacked::Metadata::from(meta)
@@ -367,8 +383,7 @@ impl ArchiveIndex {
             }
 
             let block_size = m.block_size;
-            block_size
-                .is_power_of_two()
+            (usize::try_from(block_size).is_ok() && block_size.is_power_of_two())
                 .or_context("invalid block_size")?;
 
             let sections = self.section_index.len() as u32;
@@ -486,6 +501,78 @@ impl ArchiveIndex {
             index: self,
             inode_num: 0,
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct Archive<R: ?Sized> {
+    // TODO: LRU cache.
+    cache: Option<(u64, Vec<u8>)>,
+    block_size: u32,
+
+    rdr: SectionReader<R>,
+}
+
+impl<R: ?Sized> Archive<R> {
+    pub fn into_inner(self) -> R
+    where
+        R: Sized,
+    {
+        self.rdr.into_inner()
+    }
+
+    pub fn get_ref(&self) -> &R {
+        self.rdr.get_ref()
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        self.rdr.get_mut()
+    }
+}
+
+impl<R: Read + Seek + ?Sized> Archive<R> {
+    pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)>
+    where
+        R: Sized,
+    {
+        let mut rdr = SectionReader::new(rdr);
+        let index = ArchiveIndex::new(&mut rdr)?;
+        let this = Self {
+            cache: None,
+            block_size: index.metadata().block_size,
+            rdr,
+        };
+        Ok((index, this))
+    }
+
+    fn get_cache(&self) -> &[u8] {
+        match &self.cache {
+            Some((_, cache)) => cache,
+            None => &[],
+        }
+    }
+
+    fn cache_section(&mut self, file_offset: u64) -> Result<()> {
+        if self
+            .cache
+            .as_ref()
+            .is_some_and(|(cache_offset, _)| *cache_offset == file_offset)
+        {
+            return Ok(());
+        }
+
+        self.rdr.get_mut().seek(SeekFrom::Start(file_offset))?;
+        let data = (|| {
+            let header = self.rdr.read_header()?;
+            header.check_type(SectionType::BLOCK)?;
+            // `block_size` is checked to be in `usize` range by `validate_post`.
+            self.rdr.read_data(&header, self.block_size as usize)
+        })()
+        .context(format_args!(
+            "failed to read section at offset {file_offset}"
+        ))?;
+        self.cache = Some((file_offset, data));
+        Ok(())
     }
 }
 
@@ -816,6 +903,16 @@ impl<'a> From<File<'a>> for Inode<'a> {
     }
 }
 
+impl sealed::Sealed for File<'_> {}
+impl<'a> AsChunks<'a> for File<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
+        match self {
+            File::Unique(f) => f.as_chunks(),
+            File::Shared(f) => f.as_chunks(),
+        }
+    }
+}
+
 /// A unique regular file inode.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueFile<'a> {
@@ -832,8 +929,9 @@ impl<'a> From<UniqueFile<'a>> for Inode<'a> {
     }
 }
 
-impl<'a> UniqueFile<'a> {
-    pub fn chunks(&self) -> ChunkIter<'a> {
+impl sealed::Sealed for UniqueFile<'_> {}
+impl<'a> AsChunks<'a> for UniqueFile<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
         let tbl = &self.index.metadata().chunk_table;
         let chunk_start = tbl[self.file_idx as usize];
         let chunk_end = tbl[self.file_idx as usize + 1];
@@ -845,10 +943,25 @@ impl<'a> UniqueFile<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ChunkIter<'a> {
     index: &'a ArchiveIndex,
     chunk_start: u32,
     chunk_end: u32,
+}
+
+impl ChunkIter<'_> {
+    /// Iterate over all chunks and return the sum of all chunks' byte length.
+    pub fn total_size(&self) -> u64 {
+        self.clone().map(|c| u64::from(c.size())).sum::<u64>()
+    }
+}
+
+impl sealed::Sealed for ChunkIter<'_> {}
+impl<'a> AsChunks<'a> for ChunkIter<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
+        self.clone()
+    }
 }
 
 impl<'a> Iterator for ChunkIter<'a> {
@@ -901,8 +1014,9 @@ impl<'a> From<SharedFile<'a>> for Inode<'a> {
     }
 }
 
-impl<'a> SharedFile<'a> {
-    pub fn chunks(&self) -> ChunkIter<'a> {
+impl sealed::Sealed for SharedFile<'_> {}
+impl<'a> AsChunks<'a> for SharedFile<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
         let m = self.index.metadata();
         let file_idx = self.index.inode_tally.unique_files
             + m.shared_files_table.as_ref().expect("validated")[self.shared_idx as usize];
@@ -919,15 +1033,20 @@ impl<'a> SharedFile<'a> {
 /// The description of a chunk of bytes.
 #[derive(Debug, Clone)]
 pub struct Chunk<'a> {
-    #[expect(dead_code, reason = "TODO")]
     index: &'a ArchiveIndex,
     data: unpacked::Chunk,
+    // For `HasChunks` impl.
+    chunk_idx: u32,
 }
 
 impl<'a> Chunk<'a> {
     fn new(index: &'a ArchiveIndex, chunk_idx: u32) -> Self {
         let data = index.metadata().chunks[chunk_idx as usize].clone();
-        Self { data, index }
+        Self {
+            data,
+            index,
+            chunk_idx,
+        }
     }
 
     pub fn section_idx(&self) -> u32 {
@@ -940,5 +1059,125 @@ impl<'a> Chunk<'a> {
 
     pub fn size(&self) -> u32 {
         self.data.size
+    }
+}
+
+impl sealed::Sealed for Chunk<'_> {}
+impl<'a> AsChunks<'a> for Chunk<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
+        ChunkIter {
+            index: self.index,
+            chunk_start: self.chunk_idx,
+            chunk_end: self.chunk_idx + 1,
+        }
+    }
+}
+
+/// Trait for data-bearing objects, notibly [`File`]s and [`Chunk`]s.
+///
+/// In dwarfs, regular files consist of multiple chunks of data concatenated for
+/// deduplication. You can iterate over these chunks and locate section index
+/// and offsets in order to retrieve the actual bytes.
+///
+/// This trait provides some convenient methods to access all these bytes as a
+/// [`Read`] instance via [`AsChunks::as_reader`] so you can easily
+/// [`std::io::copy`] it as a whole to the destination.
+///
+/// [`AsChunks::read_to_vec`] can also be used to efficiently read all data into
+/// memory.
+pub trait AsChunks<'a>: Sized + sealed::Sealed {
+    /// Iterate over all chunks this object consists of.
+    fn as_chunks(&self) -> ChunkIter<'a>;
+
+    /// Get a [`Read`] instance representing the concatenation of all chunks
+    /// this object consists of.
+    ///
+    /// The user must guarantee the owning [`ArchiveIndex`] of `self` and
+    /// `archive` must come from the same dwarfs archive, or the behavior is
+    /// unspecified: it may return garbage data, panic, or fail.
+    fn as_reader<'b, R>(&self, archive: &'b mut Archive<R>) -> ChunksReader<'a, 'b, R> {
+        ChunksReader {
+            archive,
+            chunks: self.as_chunks(),
+            in_section_offset: 0,
+            chunk_rest_size: 0,
+        }
+    }
+
+    /// Read all data of this object into memory.
+    ///
+    /// The user must guarantee the owning [`ArchiveIndex`] of `self` and
+    /// `archive` must come from the same dwarfs archive, or the behavior is
+    /// unspecified: it may return garbage data, panic, or fail.
+    fn read_to_vec<R: Read + Seek>(&self, archive: &mut Archive<R>) -> std::io::Result<Vec<u8>> {
+        let cap = usize::try_from(self.as_chunks().total_size()).unwrap_or(usize::MAX);
+        let mut rdr = self.as_reader(archive);
+        read_to_vec_via_buf_read(&mut rdr, cap)
+    }
+}
+
+fn read_to_vec_via_buf_read(rdr: &mut dyn BufRead, cap: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(cap);
+    loop {
+        let chunk = rdr.fill_buf()?;
+        if chunk.is_empty() {
+            break;
+        }
+        buf.extend_from_slice(chunk);
+        let len = chunk.len();
+        rdr.consume(len);
+    }
+    Ok(buf)
+}
+
+/// A [`Read`] instance returned from [`AsChunks::as_reader`].
+#[derive(Debug)]
+pub struct ChunksReader<'a, 'b, R> {
+    archive: &'b mut Archive<R>,
+    chunks: ChunkIter<'a>,
+    in_section_offset: u32,
+    chunk_rest_size: u32,
+}
+
+impl<R> ChunksReader<'_, '_, R> {
+    /// Iterate over all chunks and return the sum of all chunks' byte length.
+    ///
+    /// This number is exact, unless the dwarfs archive is changed during access
+    /// or some underlying I/O failure occurs.
+    pub fn total_size(&self) -> u64 {
+        self.chunks.total_size() + u64::from(self.chunk_rest_size)
+    }
+}
+
+impl<R: Read + Seek> Read for ChunksReader<'_, '_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let cache = self.fill_buf()?;
+        let len = cache.len().min(buf.len());
+        buf[..len].copy_from_slice(&cache[..len]);
+        self.consume(len);
+        Ok(len)
+    }
+}
+
+impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.chunk_rest_size == 0 {
+            let Some(chunk) = self.chunks.next() else {
+                return Ok(&[]);
+            };
+            self.in_section_offset = chunk.offset();
+            self.chunk_rest_size = chunk.size();
+            let file_offset =
+                self.chunks.index.section_index[chunk.section_idx() as usize].offset();
+            self.archive.cache_section(file_offset)?;
+        }
+        let cache = self.archive.get_cache();
+        Ok(&cache[self.in_section_offset as usize..][..self.chunk_rest_size as usize])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        assert!(amt <= self.chunk_rest_size as usize);
+        self.in_section_offset += amt as u32;
+        self.chunk_rest_size -= amt as u32;
     }
 }

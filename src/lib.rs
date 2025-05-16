@@ -7,6 +7,6 @@ pub mod section;
 pub const DWARFS_VERSION: (u8, u8) = (2, 5);
 
 pub use archive::{
-    ArchiveIndex, Device, Dir, DirEntry, Error, File, Inode, InodeKind, InodeMetadata, Ipc, Result,
-    SharedFile, Symlink, UniqueFile,
+    Archive, ArchiveIndex, AsChunks, Device, Dir, DirEntry, Error, File, Inode, InodeKind,
+    InodeMetadata, Ipc, Result, SharedFile, Symlink, UniqueFile,
 };

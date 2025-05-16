@@ -18,8 +18,12 @@ pub enum Error {
     MalformedSectionIndex,
     LengthMismatch,
     ChecksumMismatch,
-    IntegerOverflow,
     UnknowCompressAlgo(CompressAlgo),
+    SectionTypeMismatch {
+        expect: SectionType,
+        got: SectionType,
+    },
+    SectionDataTooLong(usize),
     Io(std::io::Error),
 }
 
@@ -30,9 +34,20 @@ impl fmt::Display for Error {
             Error::MalformedSectionIndex => "malformed section index",
             Error::LengthMismatch => "length mismatch",
             Error::ChecksumMismatch => "checksum mismatch",
-            Error::IntegerOverflow => "integer overflow",
             Error::UnknowCompressAlgo(algo) => {
                 return write!(f, "unknown section compress algorithm {algo:?}");
+            }
+            Error::SectionTypeMismatch { expect, got } => {
+                return write!(
+                    f,
+                    "section type mismatch, expect {expect:?} but got {got:?}"
+                );
+            }
+            Error::SectionDataTooLong(cap) => {
+                return write!(
+                    f,
+                    "section data is too long, exceeding the limit of {cap} bytes"
+                );
             }
 
             Error::Io(err) => return err.fmt(f),
@@ -72,7 +87,8 @@ pub struct Header {
     pub section_type: SectionType,
     /// The compression algorithm of the section data.
     pub compress_algo: CompressAlgo,
-    pub data_len: le::U64,
+    /// The length in bytes of the compressed data following.
+    pub data_size: le::U64,
 }
 
 impl fmt::Debug for Header {
@@ -84,7 +100,7 @@ impl fmt::Debug for Header {
             .field("section_number", &self.section_number.get())
             .field("section_type", &self.section_type)
             .field("compress_algo", &self.compress_algo)
-            .field("data_len", &self.data_len.get())
+            .field("data_size", &self.data_size.get())
             .finish()
     }
 }
@@ -92,7 +108,7 @@ impl fmt::Debug for Header {
 impl Header {
     /// Validate section checksum of header and data using the "fast" XXH3-64 hash.
     pub fn validate_fast_checksum(&self, data: &[u8]) -> Result<()> {
-        if data.len() as u64 != self.data_len.get() {
+        if data.len() as u64 != self.data_size.get() {
             return Err(Error::LengthMismatch);
         }
         let mut h = Xxh3Default::new();
@@ -109,7 +125,7 @@ impl Header {
     pub fn validate_slow_checksum(&self, data: &[u8]) -> Result<()> {
         use sha2::Digest;
 
-        if data.len() as u64 != self.data_len.get() {
+        if data.len() as u64 != self.data_size.get() {
             return Err(Error::LengthMismatch);
         }
         let mut h = sha2::Sha512_256::new();
@@ -120,6 +136,23 @@ impl Header {
         } else {
             Err(Error::ChecksumMismatch)
         }
+    }
+
+    /// Check if this section header has the expected section type.
+    pub(crate) fn check_type(&self, expect: SectionType) -> Result<()> {
+        (self.section_type == expect)
+            .then_some(())
+            .ok_or(Error::SectionTypeMismatch {
+                expect,
+                got: self.section_type,
+            })
+    }
+
+    fn data_size_limited(&self, limit: usize) -> Result<usize> {
+        usize::try_from(self.data_size.get())
+            .ok()
+            .filter(|&n| n <= limit)
+            .ok_or(Error::SectionDataTooLong(limit))
     }
 }
 
@@ -258,7 +291,7 @@ impl<R> SectionReader<R> {
     }
 }
 
-impl<R: Read + ?Sized> SectionReader<R> {
+impl<R: ?Sized> SectionReader<R> {
     pub fn get_ref(&self) -> &R {
         &self.rdr
     }
@@ -273,11 +306,13 @@ impl<R: Read + ?Sized> SectionReader<R> {
     {
         self.rdr
     }
+}
 
-    /// Read a section.
-    pub fn read_section(&mut self) -> Result<(Header, Vec<u8>)> {
+impl<R: Read + ?Sized> SectionReader<R> {
+    /// Read a section, limiting data size to `data_size_limit`.
+    pub fn read_section(&mut self, data_size_limit: usize) -> Result<(Header, Vec<u8>)> {
         let header = self.read_header()?;
-        let data = self.read_data(&header)?;
+        let data = self.read_data(&header, data_size_limit)?;
         Ok((header, data))
     }
 
@@ -314,37 +349,46 @@ impl<R: Read + ?Sized> SectionReader<R> {
     }
 
     /// Read and decompress section data of given section header.
-    pub fn read_data(&mut self, header: &Header) -> Result<Vec<u8>> {
-        let data_len =
-            usize::try_from(header.data_len.get()).map_err(|_| Error::IntegerOverflow)?;
-        let mut raw_data = vec![0u8; data_len];
-        self.rdr.read_exact(&mut raw_data)?;
-        header.validate_fast_checksum(&raw_data)?;
+    ///
+    /// Both compressed and decompressed size must be within `data_limit`, or an error is emitted.
+    pub fn read_data(&mut self, header: &Header, data_size_limit: usize) -> Result<Vec<u8>> {
+        let compressed_size = header.data_size_limited(data_size_limit)?;
+        let mut compressed = vec![0u8; compressed_size];
+        self.rdr.read_exact(&mut compressed)?;
+        header.validate_fast_checksum(&compressed)?;
 
         match header.compress_algo {
-            CompressAlgo::NONE => Ok(raw_data),
-            CompressAlgo::ZSTD => Ok(zstd::decode_all(&raw_data[..])?),
+            CompressAlgo::NONE => Ok(compressed),
+            CompressAlgo::ZSTD => {
+                let mut out = vec![0u8; data_size_limit];
+                let len = zstd::bulk::decompress_to_buffer(&compressed, &mut out)?;
+                debug_assert!(len <= out.len());
+                out.truncate(len);
+                Ok(out)
+            }
             // TODO: More algorithms.
             algo => Err(Error::UnknowCompressAlgo(algo)),
         }
     }
 
-    /// Seek and read the section index, assuming its existence.
+    /// Seek and read the section index, assuming its existence, with a limited data size.
     pub fn seek_read_section_index(
         &mut self,
         image_offset: u64,
+        data_size_limit: usize,
     ) -> Result<(Header, Vec<SectionIndexEntry>)>
     where
         R: Seek,
     {
         let header = self.seek_read_section_index_header(image_offset)?;
+        // Checked by header reader. So we can read raw bytes here.
         debug_assert_eq!(header.compress_algo, CompressAlgo::NONE);
-        let bytes_len =
-            usize::try_from(header.data_len.get()).map_err(|_| Error::IntegerOverflow)?;
-        let num_sections = bytes_len / size_of::<SectionIndexEntry>();
+        let data_size = header.data_size_limited(data_size_limit)?;
+
+        let num_sections = data_size / size_of::<SectionIndexEntry>();
         let mut buf = SectionIndexEntry::new_vec_zeroed(num_sections).unwrap();
         let buf_bytes = buf.as_mut_bytes();
-        debug_assert_eq!(buf_bytes.len(), bytes_len);
+        debug_assert_eq!(buf_bytes.len(), data_size);
 
         self.rdr.read_exact(buf_bytes)?;
         header.validate_fast_checksum(buf_bytes)?;
@@ -372,14 +416,14 @@ impl<R: Read + ?Sized> SectionReader<R> {
         self.rdr.seek(SeekFrom::Start(abs_offset))?;
         let header = self.read_header()?;
 
-        let num_sections = header.data_len.get() / size_of::<SectionIndexEntry>() as u64;
+        let num_sections = header.data_size.get() / size_of::<SectionIndexEntry>() as u64;
         if header.section_type == SectionType::SECTION_INDEX
             && header.compress_algo == CompressAlgo::NONE
-            && header.data_len.get() % size_of::<SectionIndexEntry>() as u64 == 0
+            && header.data_size.get() % size_of::<SectionIndexEntry>() as u64 == 0
             && u64::from(header.section_number.get()) + 1 == num_sections
             && abs_offset
                 .checked_add(size_of::<Header>() as u64)
-                .and_then(|x| x.checked_add(header.data_len.get()))
+                .and_then(|x| x.checked_add(header.data_size.get()))
                 == Some(rdr_end_pos)
         {
             Ok(header)
