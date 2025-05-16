@@ -108,13 +108,27 @@ impl<T> OptionExt<T> for Option<T> {
     }
 }
 
+trait BoolExt {
+    fn or_context(self, msg: &'static str) -> Result<()>;
+}
+impl BoolExt for bool {
+    #[inline]
+    fn or_context(self, msg: &'static str) -> Result<()> {
+        if self {
+            Ok(())
+        } else {
+            Err(ErrorInner::Validation(msg).into())
+        }
+    }
+}
+
 pub struct ArchiveIndex {
     section_index: Box<[SectionIndexEntry]>,
     metadata: unpacked::Metadata,
 
     mtime_only: bool,
     time_resolution: NonZero<u32>,
-    timestamp_base: u64,
+    timestamp_base_scaled: u64,
     name_table_decoder: Option<Box<Decoder>>,
     symlink_table_decoder: Option<Box<Decoder>>,
     inode_tally: InodeTally,
@@ -128,7 +142,7 @@ impl fmt::Debug for ArchiveIndex {
             // NB. Always hide large structs.
             d.field("mtime_only", &self.mtime_only)
                 .field("time_resolution", &self.time_resolution)
-                .field("timestamp_base", &self.timestamp_base)
+                .field("timestamp_base_scaled", &self.timestamp_base_scaled)
                 .field("name_table_decoder", &self.name_table_decoder)
                 .field("symlink_table_decoder", &self.symlink_table_decoder)
                 .field("inode_tally", &self.inode_tally);
@@ -206,8 +220,8 @@ impl ArchiveIndex {
             symlink_table_decoder: None,
 
             mtime_only: false,
-            time_resolution: NonZero::new(1).unwrap(),
-            timestamp_base: 0,
+            time_resolution: NonZero::new(1).expect("1 is non-zero"),
+            timestamp_base_scaled: 0,
             inode_tally: Default::default(),
         };
         this.validate_post()?;
@@ -233,6 +247,10 @@ impl ArchiveIndex {
             self.mtime_only = opts.mtime_only;
             self.time_resolution = NonZero::new(opts.time_resolution_sec.unwrap_or(1))
                 .context("invalid options.time_resolution_sec")?;
+            self.timestamp_base_scaled = m
+                .timestamp_base
+                .checked_mul(self.time_resolution.get().into())
+                .context("timestamp_base overflow")?;
 
             if opts.packed_directories {
                 let mut sum = 0u32;
@@ -254,9 +272,7 @@ impl ArchiveIndex {
             // NB. Minus the sentinel.
             let dir_cnt = m.directories.len().saturating_sub(1);
             let file_store_cnt = m.chunk_table.len().saturating_sub(1);
-            (dir_cnt >= 1)
-                .then_some(())
-                .context("missing root directory")?;
+            (dir_cnt >= 1).or_context("missing root directory")?;
 
             // Lengths will not overflow `u32`, checked by metadata parser.
             // And of course they cannot overflow `usize` because they are all in memory.
@@ -281,9 +297,7 @@ impl ArchiveIndex {
             let shared_start = unique_start + unique_cnt as usize;
             let device_start = shared_start + shared_cnt;
             let ipc_start = device_start + device_cnt;
-            (ipc_start <= inode_cnt)
-                .then_some(())
-                .context("inodes table too short")?;
+            (ipc_start <= inode_cnt).or_context("inodes table too short")?;
 
             self.inode_tally = InodeTally {
                 unique_files: 0,
@@ -296,29 +310,131 @@ impl ArchiveIndex {
         }
 
         // Unpack string tables, currently `compact_{names,symlinks}`.
-        let unpack_string_table =
-            |tbl: &mut unpacked::StringTable, msg: &'static str| -> Result<Option<Box<Decoder>>> {
-                if tbl.packed_index {
-                    let mut sum = 0;
-                    for v in &mut tbl.index {
-                        sum += *v;
-                        *v = sum;
-                    }
+        fn unpack_string_table(
+            out: &mut Option<Box<Decoder>>,
+            tbl: &mut Option<unpacked::StringTable>,
+            msg_index: &'static str,
+            msg_symtab: &'static str,
+        ) -> Result<()> {
+            let Some(tbl) = tbl else { return Ok(()) };
+            let len = tbl.buffer.len() as u32;
+            if tbl.packed_index {
+                let mut sum = 0u32;
+                for v in &mut tbl.index {
+                    sum = sum
+                        .checked_add(*v)
+                        .filter(|&i| i <= len)
+                        .context(msg_index)?;
+                    *v = sum;
                 }
-                Ok(if let Some(symtab_bytes) = &tbl.symtab {
-                    let decoder = Decoder::parse_symtab(symtab_bytes).context(msg)?;
-                    Some(Box::new(decoder))
-                } else {
-                    None
-                })
-            };
-        if let Some(tbl) = &mut m.compact_names {
-            self.name_table_decoder =
-                unpack_string_table(tbl, "failed to parse compact_names.symtab")?;
+            } else {
+                for &v in &tbl.index {
+                    (v <= len).or_context(msg_index)?;
+                }
+            }
+            if let Some(symtab_bytes) = &tbl.symtab {
+                let decoder = Decoder::parse_symtab(symtab_bytes).context(msg_symtab)?;
+                *out = Some(Box::new(decoder));
+            }
+            Ok(())
         }
-        if let Some(tbl) = &mut m.compact_symlinks {
-            self.symlink_table_decoder =
-                unpack_string_table(tbl, "failed to parse compact_symlinks.symtab")?;
+
+        (m.compact_names.is_none() || m.names.is_empty())
+            .or_context("names must be empty when compact_names is used")?;
+        unpack_string_table(
+            &mut self.name_table_decoder,
+            &mut m.compact_names,
+            "index out of range for compact_names.index",
+            "failed to parse compact_names.symtab",
+        )?;
+
+        (m.compact_symlinks.is_none() || m.symlinks.is_empty())
+            .or_context("symlinks must be empty when compact_symlinks is used")?;
+        unpack_string_table(
+            &mut self.symlink_table_decoder,
+            &mut m.compact_symlinks,
+            "index out of range for compact_symlinks.index",
+            "failed to parse compact_symlinks.symtab",
+        )?;
+
+        // Validate contents, mostly about indexes.
+        // TODO: Maybe just cache the indirection result?
+        {
+            macro_rules! check {
+                ($cond:expr, $msg:literal) => {
+                    $cond.or_context(concat!("index out of range in ", $msg))?
+                };
+            }
+
+            let block_size = m.block_size;
+            block_size
+                .is_power_of_two()
+                .or_context("invalid block_size")?;
+
+            let sections = self.section_index.len() as u32;
+            for c in &m.chunks {
+                check!(c.block < sections, "chunks.block");
+                c.offset
+                    .checked_add(c.size)
+                    .filter(|&end| end <= block_size)
+                    .context("offset out of range in chunks")?;
+            }
+
+            let entries = m.dir_entries.as_ref().expect("validated").len() as u32;
+            for d in &m.directories {
+                check!(d.first_entry <= entries, "directories.first_entry");
+                check!(d.parent_entry <= entries, "directories.parent_entry");
+                check!(d.self_entry <= entries, "directories.self_entry");
+            }
+
+            let uids = m.uids.len() as u32;
+            let gids = m.gids.len() as u32;
+            let modes = m.modes.len() as u32;
+            let check_time = |time_off: u32, msg: &'static str| {
+                u64::from(time_off)
+                    .checked_mul(self.time_resolution.get().into())
+                    .and_then(|x| x.checked_add(m.timestamp_base))
+                    .context(msg)
+            };
+            for ino in &m.inodes {
+                check!(ino.owner_index < uids, "inodes.owner_index");
+                check!(ino.group_index < gids, "inodes.group_index");
+                check!(ino.mode_index < modes, "inodes.mode_index");
+                check_time(ino.mtime_offset, "inodes.mtime_offset overflows")?;
+                if self.mtime_only {
+                    (ino.atime_offset == 0 && ino.ctime_offset == 0).or_context(
+                        "inodes.{a,c}time_offset is not zero when options.mtime_only is set",
+                    )?;
+                } else {
+                    check_time(ino.atime_offset, "inodes.atime_offset overflows")?;
+                    check_time(ino.ctime_offset, "inodes.ctime_offset overflows")?;
+                }
+            }
+
+            let chunks = m.chunks.len() as u32;
+            for &c in &m.chunk_table {
+                check!(c <= chunks, "chunk_table");
+            }
+
+            let symlink_targets = m
+                .compact_symlinks
+                .as_ref()
+                .map_or(m.symlinks.len(), |tbl| tbl.index.len().saturating_sub(1))
+                as u32;
+            for &i in &m.symlink_table {
+                check!(i < symlink_targets, "symlink_table");
+            }
+
+            let inodes = m.inodes.len() as u32;
+            let names = m
+                .compact_names
+                .as_ref()
+                .map_or(m.names.len(), |tbl| tbl.index.len().saturating_sub(1))
+                as u32;
+            for ent in m.dir_entries.as_ref().expect("validated") {
+                check!(ent.inode_num < inodes, "dir_entries.inode_num");
+                check!(ent.name_index < names, "dir_entries.name_index");
+            }
         }
 
         Ok(())
@@ -422,7 +538,7 @@ impl<'a> Inode<'a> {
 
     /// Get the metadata of this inode.
     pub fn metadata(&self) -> InodeMetadata<'a> {
-        InodeMetadata::new(self.index, self.inode_num).expect("validated")
+        InodeMetadata::new(self.index, self.inode_num)
     }
 }
 
@@ -490,42 +606,29 @@ pub struct InodeMetadata<'a> {
 }
 
 impl<'a> InodeMetadata<'a> {
-    fn new(index: &'a ArchiveIndex, inode_num: u32) -> Option<Self> {
-        let data = index.metadata().inodes.get(inode_num as usize)?.clone();
-        Some(Self { index, data })
+    fn new(index: &'a ArchiveIndex, inode_num: u32) -> Self {
+        let data = index.metadata().inodes[inode_num as usize].clone();
+        Self { index, data }
     }
 
     /// The mode of the inode, including file types and permissions.
-    // FIXME: This should not fail, same as other methods.
-    pub fn mode(&self) -> Option<u32> {
-        self.index
-            .metadata()
-            .modes
-            .get(self.data.mode_index as usize)
-            .copied()
+    pub fn mode(&self) -> u32 {
+        self.index.metadata().modes[self.data.mode_index as usize]
     }
 
     /// The owner user id (uid) of the inode.
-    pub fn owner(&self) -> Option<u32> {
-        self.index
-            .metadata()
-            .uids
-            .get(self.data.owner_index as usize)
-            .copied()
+    pub fn owner(&self) -> u32 {
+        self.index.metadata().uids[self.data.owner_index as usize]
     }
 
     /// The owner group id (gid) of the inode.
-    pub fn group(&self) -> Option<u32> {
-        self.index
-            .metadata()
-            .gids
-            .get(self.data.group_index as usize)
-            .copied()
+    pub fn group(&self) -> u32 {
+        self.index.metadata().gids[self.data.group_index as usize]
     }
 
     fn cvt_time(&self, time_offset: u32) -> u64 {
-        (self.index.timestamp_base + u64::from(time_offset))
-            * u64::from(self.index.time_resolution.get())
+        self.index.timestamp_base_scaled
+            + u64::from(time_offset) * u64::from(self.index.time_resolution.get())
     }
 
     /// The last modified time, in the seconds since UNIX epoch.
@@ -587,7 +690,7 @@ impl<'a> Iterator for DirEntryIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.ent_start < self.ent_end {
-            let ent = DirEntry::new(self.index, self.ent_start)?;
+            let ent = DirEntry::new(self.index, self.ent_start);
             self.ent_start += 1;
             Some(ent)
         } else {
@@ -599,7 +702,7 @@ impl<'a> Iterator for DirEntryIter<'a> {
 impl DoubleEndedIterator for DirEntryIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.ent_start < self.ent_end {
-            let ent = DirEntry::new(self.index, self.ent_end - 1)?;
+            let ent = DirEntry::new(self.index, self.ent_end - 1);
             self.ent_end -= 1;
             Some(ent)
         } else {
@@ -619,18 +722,13 @@ pub struct DirEntry<'a> {
 }
 
 impl<'a> DirEntry<'a> {
-    // FIXME: This should not fail.
-    fn new(index: &'a ArchiveIndex, ent_idx: u32) -> Option<Self> {
-        // FIXME: What if `dir_entries` is None?
-        let data = index
-            .metadata()
-            .dir_entries
-            .as_ref()?
-            .get(ent_idx as usize)?
-            .clone();
-        Some(Self { index, data })
+    fn new(index: &'a ArchiveIndex, ent_idx: u32) -> Self {
+        let data =
+            index.metadata().dir_entries.as_ref().expect("validated")[ent_idx as usize].clone();
+        Self { index, data }
     }
 
+    // FIXME: This should not fail.
     pub fn name(&self) -> Option<BString> {
         self.index.get_name_by_index(self.data.name_index)
     }
@@ -662,11 +760,7 @@ impl<'a> From<Symlink<'a>> for Inode<'a> {
 impl Symlink<'_> {
     // FIXME: This should not fail.
     pub fn target(&self) -> Option<BString> {
-        let tgt_idx = *self
-            .index
-            .metadata()
-            .symlink_table
-            .get(self.symlink_idx as usize)?;
+        let tgt_idx = self.index.metadata().symlink_table[self.symlink_idx as usize];
         self.index.get_symlink_target_by_index(tgt_idx)
     }
 }
@@ -689,12 +783,7 @@ impl<'a> From<Device<'a>> for Inode<'a> {
 
 impl Device<'_> {
     pub fn device_id(&self) -> u64 {
-        self.index
-            .metadata()
-            .devices
-            .as_ref()
-            .and_then(|v| v.get(self.device_idx as usize).copied())
-            .expect("validated")
+        self.index.metadata().devices.as_ref().expect("validated")[self.device_idx as usize]
     }
 }
 
