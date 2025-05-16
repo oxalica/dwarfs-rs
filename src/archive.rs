@@ -16,12 +16,6 @@ use crate::{
     section::{SectionIndexEntry, SectionReader, SectionType},
 };
 
-// Some arbitrarily chosen numbers.
-// TODO: These should be configurable.
-const DEFAULT_SECTION_INDEX_SIZE_LIMIT: usize = 64 << 20;
-const DEFAULT_METADATA_SCHEMA_SIZE_LIMIT: usize = 1 << 20;
-const DEFAULT_METADATA_SIZE_LIMIT: usize = 16 << 20;
-
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct Error(Box<ErrorInner>);
@@ -140,6 +134,48 @@ impl BoolExt for bool {
     }
 }
 
+#[derive(Debug)]
+pub struct Config {
+    image_offset: u64,
+    section_index_size_limit: usize,
+    metadata_schema_size_limit: usize,
+    metadata_size_limit: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            image_offset: 0,
+            // Some arbitrarily chosen numbers.
+            section_index_size_limit: 64 << 20,
+            metadata_schema_size_limit: 1 << 20,
+            metadata_size_limit: 16 << 20,
+        }
+    }
+}
+
+impl Config {
+    pub fn image_offset(&mut self, offset: u64) -> &mut Self {
+        self.image_offset = offset;
+        self
+    }
+
+    pub fn section_index_size_limit(&mut self, limit: usize) -> &mut Self {
+        self.section_index_size_limit = limit;
+        self
+    }
+
+    pub fn metadata_schema_size_limit(&mut self, limit: usize) -> &mut Self {
+        self.metadata_schema_size_limit = limit;
+        self
+    }
+
+    pub fn metadata_size_limit(&mut self, limit: usize) -> &mut Self {
+        self.metadata_size_limit = limit;
+        self
+    }
+}
+
 pub struct ArchiveIndex {
     section_index: Box<[SectionIndexEntry]>,
     metadata: unpacked::Metadata,
@@ -186,9 +222,18 @@ struct InodeTally {
 
 impl ArchiveIndex {
     pub fn new<R: Read + Seek>(rdr: &mut SectionReader<R>) -> Result<Self> {
+        Self::new_with_config(rdr, &Config::default())
+    }
+
+    pub fn new_with_config<R: Read + Seek>(
+        rdr: &mut SectionReader<R>,
+        config: &Config,
+    ) -> Result<Self> {
+        let image_offset = config.image_offset;
+
         // Load section index.
         let (_, section_index) = rdr
-            .seek_read_section_index(0, DEFAULT_SECTION_INDEX_SIZE_LIMIT)
+            .seek_read_section_index(image_offset, config.section_index_size_limit)
             .context("failed to load section index")?;
         u32::try_from(section_index.len())
             .ok()
@@ -207,20 +252,22 @@ impl ArchiveIndex {
             }
             Ok(off)
         };
-        let schema_offset = find_unique_section(SectionType::METADATA_V2_SCHEMA)?;
-        let metadata_offset = find_unique_section(SectionType::METADATA_V2)?;
+        let schema_offset =
+            find_unique_section(SectionType::METADATA_V2_SCHEMA)?.saturating_add(image_offset);
+        let metadata_offset =
+            find_unique_section(SectionType::METADATA_V2)?.saturating_add(image_offset);
 
         // Load and unpack metadata.
         let metadata = {
             rdr.get_mut().seek(SeekFrom::Start(schema_offset))?;
             let (_, raw_schema) = rdr
-                .read_section(DEFAULT_METADATA_SCHEMA_SIZE_LIMIT)
+                .read_section(config.metadata_schema_size_limit)
                 .context("failed to read metadata schema section")?;
             let schema = Schema::parse(&raw_schema).map_err(ErrorInner::Schema)?;
 
             rdr.get_mut().seek(SeekFrom::Start(metadata_offset))?;
             let (_, raw_metadata) = rdr
-                .read_section(DEFAULT_METADATA_SIZE_LIMIT)
+                .read_section(config.metadata_size_limit)
                 .context("failed to read metadata section")?;
             let meta = Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::Metadata)?;
             unpacked::Metadata::from(meta)
@@ -549,6 +596,7 @@ pub struct Archive<R: ?Sized> {
     // TODO: LRU cache.
     cache: Option<(u64, Vec<u8>)>,
     block_size: u32,
+    image_offset: u64,
 
     rdr: SectionReader<R>,
 }
@@ -560,17 +608,22 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
     {
         let mut rdr = SectionReader::new(rdr);
         let index = ArchiveIndex::new(&mut rdr)?;
-        let this = Self::new_with_index(rdr, &index);
+        let this = Self::new_with_index_and_config(rdr, &index, &Config::default());
         Ok((index, this))
     }
 
-    pub fn new_with_index(rdr: SectionReader<R>, index: &ArchiveIndex) -> Self
+    pub fn new_with_index_and_config(
+        rdr: SectionReader<R>,
+        index: &ArchiveIndex,
+        config: &Config,
+    ) -> Self
     where
         R: Sized,
     {
         Self {
             cache: None,
             block_size: index.metadata().block_size,
+            image_offset: config.image_offset,
             rdr,
         }
     }
@@ -582,16 +635,18 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
         }
     }
 
-    fn cache_section(&mut self, file_offset: u64) -> Result<()> {
+    fn cache_section(&mut self, archive_offset: u64) -> Result<()> {
         if self
             .cache
             .as_ref()
-            .is_some_and(|(cache_offset, _)| *cache_offset == file_offset)
+            .is_some_and(|(cache_offset, _)| *cache_offset == archive_offset)
         {
             return Ok(());
         }
 
-        self.rdr.get_mut().seek(SeekFrom::Start(file_offset))?;
+        self.rdr.get_mut().seek(SeekFrom::Start(
+            archive_offset.saturating_add(self.image_offset),
+        ))?;
         let data = (|| {
             let header = self.rdr.read_header()?;
             header.check_type(SectionType::BLOCK)?;
@@ -599,9 +654,10 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
             self.rdr.read_data(&header, self.block_size as usize)
         })()
         .context(format_args!(
-            "failed to read section at offset {file_offset}"
+            "failed to read section at archive offset {} + image offset {}",
+            archive_offset, self.image_offset,
         ))?;
-        self.cache = Some((file_offset, data));
+        self.cache = Some((archive_offset, data));
         Ok(())
     }
 }
@@ -1234,9 +1290,9 @@ impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
             };
             self.in_section_offset = chunk.offset();
             self.chunk_rest_size = chunk.size();
-            let file_offset =
+            let archive_offset =
                 self.chunks.index.section_index[chunk.section_idx() as usize].offset();
-            self.archive.cache_section(file_offset)?;
+            self.archive.cache_section(archive_offset)?;
         }
         let cache = self.archive.get_cache();
         Ok(&cache[self.in_section_offset as usize..][..self.chunk_rest_size as usize])
