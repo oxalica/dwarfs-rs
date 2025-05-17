@@ -26,7 +26,7 @@ mod sealed {
 
 #[derive(Debug)]
 enum ErrorInner {
-    Section(String, crate::section::Error),
+    Section(String, Option<crate::section::Error>),
     MissingSection(SectionType),
     DuplicatedSection(SectionType),
     Schema(SchemaError),
@@ -45,7 +45,8 @@ impl fmt::Debug for Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &*self.0 {
-            ErrorInner::Section(msg, err) => write!(f, "{msg}: {err}"),
+            ErrorInner::Section(msg, Some(err)) => write!(f, "{msg}: {err}"),
+            ErrorInner::Section(msg, None) => write!(f, "{msg}"),
             ErrorInner::MissingSection(ty) => write!(f, "missing section {ty:?}"),
             ErrorInner::DuplicatedSection(ty) => write!(f, "duplicated sections {ty:?}"),
             ErrorInner::Io(err) => write!(f, "input/outpur error: {err}"),
@@ -60,14 +61,11 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &*self.0 {
-            ErrorInner::Section(_, err) => Some(err),
+            ErrorInner::Section(_, Some(err)) => Some(err),
             ErrorInner::Io(err) => Some(err),
             ErrorInner::Schema(err) => Some(err),
             ErrorInner::Metadata(err) => Some(err),
-            ErrorInner::MissingSection(_)
-            | ErrorInner::DuplicatedSection(_)
-            | ErrorInner::Validation(_)
-            | ErrorInner::UnsupportedFeature(_) => None,
+            _ => None,
         }
     }
 }
@@ -102,7 +100,7 @@ impl<T> ResultExt<T> for Result<T, crate::section::Error> {
     fn context(self, msg: impl fmt::Display) -> Result<T> {
         match self {
             Ok(v) => Ok(v),
-            Err(err) => Err(ErrorInner::Section(msg.to_string(), err).into()),
+            Err(err) => Err(ErrorInner::Section(msg.to_string(), Some(err)).into()),
         }
     }
 }
@@ -239,6 +237,7 @@ impl ArchiveIndex {
             .ok()
             .context("too many sections")?;
         let section_index = section_index.into_boxed_slice();
+        Self::validate_section_index(&section_index, config)?;
 
         // Find metadata sections.
         let find_unique_section = |sec_ty: SectionType| -> Result<u64> {
@@ -284,6 +283,22 @@ impl ArchiveIndex {
         };
         this.unpack_validate()?;
         Ok(this)
+    }
+
+    /// Validate the section index.
+    fn validate_section_index(sections: &[SectionIndexEntry], config: &Config) -> Result<()> {
+        // TODO: This sorted property seems to be undocumented. Need some clarification.
+        sections
+            .windows(2)
+            .all(|w| w[0].offset() < w[1].offset())
+            .or_context("offsets in section index is not sorted")?;
+
+        if let Some(sec) = sections.last() {
+            sec.offset()
+                .checked_add(config.image_offset)
+                .context("section offset overflow")?;
+        }
+        Ok(())
     }
 
     /// Guard on filesystem features, unpack packed fields, build decoders and validate index ranges.
@@ -619,15 +634,26 @@ impl ArchiveIndex {
 
 #[derive(Debug)]
 pub struct Archive<R: ?Sized> {
+    cache_bytes: Box<[u8]>,
     // TODO: LRU cache.
-    cache: Option<(u64, Vec<u8>)>,
-    block_size: u32,
+    cache_entry: BlockCacheEntry,
     image_offset: u64,
 
     rdr: SectionReader<R>,
 }
 
+#[derive(Debug)]
+struct BlockCacheEntry {
+    section_idx: u32,
+    len: u32,
+}
+
 impl<R: Read + Seek + ?Sized> Archive<R> {
+    /// Load a dwarfs archive (aka. dwarfs image) from a [`Seek`]-able stream,
+    /// typically a [`std::fs::File`].
+    ///
+    /// Note that you do NOT want [`BufReader`][std::io::BufReader] on the
+    /// stream, because [`Archive`] already has internal caches.
     pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)>
     where
         R: Sized,
@@ -646,47 +672,63 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
     where
         R: Sized,
     {
+        let block_size = index.metadata().block_size;
         Self {
-            cache: None,
-            block_size: index.metadata().block_size,
+            cache_bytes: vec![0u8; block_size as usize].into_boxed_slice(),
+            cache_entry: BlockCacheEntry {
+                section_idx: !0,
+                len: 0,
+            },
             image_offset: config.image_offset,
             rdr,
         }
     }
 
-    fn get_cache(&self) -> (u64, &[u8]) {
-        match &self.cache {
-            Some((archive_offset, cache)) => (*archive_offset, cache),
-            None => (!0, &[]),
-        }
-    }
-
-    fn cache_section(&mut self, archive_offset: u64) -> Result<()> {
-        if self
-            .cache
-            .as_ref()
-            .is_some_and(|(cache_offset, _)| *cache_offset == archive_offset)
-        {
-            log::trace!("block at {archive_offset}: cache hit");
+    /// Cache a block section's content if it's not available yet.
+    ///
+    /// Calculates file offset, handles cache miss and out-of-range errors on short read.
+    fn cache_block(&mut self, index: &ArchiveIndex, section_idx: u32) -> Result<()> {
+        if self.cache_entry.section_idx == section_idx {
+            log::trace!("block {section_idx}: cache hit");
             return Ok(());
         }
 
-        let data = (|| {
-            measure_time::trace_time!("block at {archive_offset}: cache miss");
-            self.rdr.get_mut().seek(SeekFrom::Start(
-                archive_offset.saturating_add(self.image_offset),
-            ))?;
+        measure_time::trace_time!("block {section_idx}: cache miss");
+
+        let archive_offset = index.section_index()[section_idx as usize].offset();
+        // Checked not to overflow by `ArchiveIndex::validate_section_index`.
+        let file_offset = self.image_offset + archive_offset;
+
+        (|| {
+            self.rdr.get_mut().seek(SeekFrom::Start(file_offset))?;
             let header = self.rdr.read_header()?;
             header.check_type(SectionType::BLOCK)?;
-            // `block_size` is checked to be in `usize` range by `validate_post`.
-            self.rdr.read_data(&header, self.block_size as usize)
+
+            // Block size is in u32 range.
+            let len = self.rdr.read_data_into(&header, &mut self.cache_bytes)? as u32;
+            self.cache_entry = BlockCacheEntry { section_idx, len };
+
+            Ok(())
         })()
-        .context(format_args!(
-            "failed to read section at archive offset {} + image offset {}",
-            archive_offset, self.image_offset,
-        ))?;
-        self.cache = Some((archive_offset, data));
-        Ok(())
+        .context(format_args!("failed to read block {section_idx}"))
+    }
+
+    /// Get a chunk inside the most recently cached block.
+    fn get_chunk_in_cache(&self, start: u32, end: u32) -> Result<&[u8]> {
+        let cache = &self.cache_bytes[..self.cache_entry.len as usize];
+        let chunk = cache.get(start as usize..end as usize).ok_or_else(
+            #[cold]
+            || {
+                let section_idx = self.cache_entry.section_idx;
+                let cache_len = cache.len();
+                let msg = format!(
+                    "block {section_idx} has only {cache_len} bytes \
+                    but is referenced at {start}..{end}",
+                );
+                ErrorInner::Section(msg, None)
+            },
+        )?;
+        Ok(chunk)
     }
 }
 
@@ -1211,6 +1253,19 @@ impl<'a> Chunk<'a> {
     pub fn size(&self) -> u32 {
         self.data.size
     }
+
+    /// Read this chunk into [`Archive`]'s cache if needed and return the bytes.
+    ///
+    /// If the section (block) containing this chunk is already in cache, this
+    /// function performs no read on the underlying stream.
+    pub fn read_cached<'b, R: Read + Seek + ?Sized>(
+        &self,
+        archive: &'b mut Archive<R>,
+    ) -> Result<&'b [u8]> {
+        archive.cache_block(self.index, self.section_idx())?;
+        // Chunk offsets will not overflow, checked by `unpack_validate`.
+        archive.get_chunk_in_cache(self.offset(), self.offset() + self.size())
+    }
 }
 
 impl sealed::Sealed for Chunk<'_> {}
@@ -1255,33 +1310,45 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
         }
     }
 
-    /// Read all data of this object into memory.
+    /// Read all data from this object into a `Vec`.
     ///
-    /// The user must guarantee the owning [`ArchiveIndex`] of `self` and
-    /// `archive` must come from the same dwarfs archive, or the behavior is
-    /// unspecified: it may return garbage data, panic, or fail.
+    /// This is a convenient shortcut method, but might be less efficient than
+    /// [`Read::read_to_end`] because it forces an allocation.
+    ///
+    /// See [`AsChunks::as_reader`] for the validity requirement on `archiev`.
     fn read_to_vec<R: Read + Seek>(&self, archive: &mut Archive<R>) -> std::io::Result<Vec<u8>> {
-        let cap = usize::try_from(self.as_chunks().total_size()).unwrap_or(usize::MAX);
-        let mut rdr = self.as_reader(archive);
-        read_to_vec_via_buf_read(&mut rdr, cap)
+        let mut out = Vec::new();
+        self.as_reader(archive).read_to_end(&mut out)?;
+        Ok(out)
     }
 }
 
-fn read_to_vec_via_buf_read(rdr: &mut dyn BufRead, cap: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(cap);
+fn read_to_end_via_buf_read(
+    rdr: &mut dyn BufRead,
+    out: &mut Vec<u8>,
+    size: usize,
+) -> std::io::Result<()> {
+    out.reserve(size);
+    let mut total_size = 0usize;
     loop {
         let chunk = rdr.fill_buf()?;
         if chunk.is_empty() {
             break;
         }
-        buf.extend_from_slice(chunk);
+        out.extend_from_slice(chunk);
         let len = chunk.len();
+        total_size += len;
         rdr.consume(len);
     }
-    Ok(buf)
+    assert_eq!(total_size, size, "short read should fail in Read impl");
+    Ok(())
 }
 
-/// A [`Read`] instance returned from [`AsChunks::as_reader`].
+/// A reader returned from [`AsChunks::as_reader`].
+///
+/// - This implements [`Read`] and [`BufRead`] thus can be used as a source for
+///   [`std::io::copy`].
+/// - This implements [`Iterator`] to read in chunks.
 #[derive(Debug)]
 pub struct ChunksReader<'a, 'b, R> {
     archive: &'b mut Archive<R>,
@@ -1308,6 +1375,13 @@ impl<R: Read + Seek> Read for ChunksReader<'_, '_, R> {
         self.consume(len);
         Ok(len)
     }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        // `usize::MAX` will trigger a `reserve` panic in `read_to_end_via_buf_read`.
+        let size = usize::try_from(self.total_size()).unwrap_or(usize::MAX);
+        read_to_end_via_buf_read(self, buf, size)?;
+        Ok(size)
+    }
 }
 
 impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
@@ -1318,28 +1392,14 @@ impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
             };
             self.in_section_offset = chunk.offset();
             self.chunk_rest_size = chunk.size();
-            let archive_offset =
-                self.chunks.index.section_index[chunk.section_idx() as usize].offset();
-            self.archive.cache_section(archive_offset)?;
+            self.archive.cache_block(chunk.index, chunk.section_idx())?;
         }
-
-        let (archive_offset, cache) = self.archive.get_cache();
-        let start = self.in_section_offset as usize;
-        let end = start + self.chunk_rest_size as usize;
-        cache.get(start..end).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "invalid section data at archive offset {} + image offset {}, \
-                    expecting a chunk at {}..{}, but decompressed data length is {}",
-                    archive_offset,
-                    self.archive.image_offset,
-                    start,
-                    end,
-                    cache.len(),
-                ),
-            )
-        })
+        let chunk = self.archive.get_chunk_in_cache(
+            self.in_section_offset,
+            // Chunk offsets will not overflow, checked by `unpack_validate`.
+            self.in_section_offset + self.chunk_rest_size,
+        )?;
+        Ok(chunk)
     }
 
     fn consume(&mut self, amt: usize) {

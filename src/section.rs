@@ -279,14 +279,34 @@ impl SectionIndexEntry {
 }
 
 /// The wrapper type for reading sections from a [`Read`] type.
-#[derive(Debug)]
 pub struct SectionReader<R: ?Sized> {
+    /// The temporarly buffer for raw compressed section data.
+    /// It is stored only for allocation reuse. This struct is still state-less.
+    raw_buf: Vec<u8>,
     rdr: R,
 }
 
+impl<R: fmt::Debug + ?Sized> fmt::Debug for SectionReader<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SectionReader")
+            .field("buf_len", &self.raw_buf.len())
+            .field("rdr", &&self.rdr)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<R> SectionReader<R> {
+    /// Create a new section reader wrapping an existing stream, typically, [`File`][std::fs::File].
+    ///
+    /// Note that usually you do NOT need [`BufReader`][std::io::BufReader],
+    /// because the section (block) size is quite large in several MiB.
+    /// And high-level wrappers like [`Archive`][crate::Archive] already has
+    /// internal caches.
     pub fn new(rdr: R) -> Self {
-        Self { rdr }
+        Self {
+            raw_buf: Vec::new(),
+            rdr,
+        }
     }
 }
 
@@ -347,49 +367,57 @@ impl<R: Read + ?Sized> SectionReader<R> {
         }
     }
 
-    /// Read and decompress section data of given section header.
+    /// Read and decompress section data of given section header into a owned `Vec`.
     ///
     /// Both compressed and decompressed size must be within `data_limit`, or an error is emitted.
+    ///
+    /// This method always allocates thus is less efficient than [`SectionReader::read_data_into`].
     pub fn read_data(&mut self, header: &Header, data_size_limit: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; data_size_limit];
+        let len = self.read_data_into(header, &mut out)?;
+        out.truncate(len);
+        Ok(out)
+    }
+
+    /// Read and decompress section data of given section header, into a buffer.
+    ///
+    /// Both compressed and decompressed size must be within `data_limit`, or an error is emitted.
+    pub fn read_data_into(&mut self, header: &Header, out: &mut [u8]) -> Result<usize> {
+        let data_size_limit = out.len();
         let compressed_size = header.data_size_limited(data_size_limit)?;
-        let mut compressed = vec![0u8; compressed_size];
-        self.rdr.read_exact(&mut compressed)?;
-        header.validate_fast_checksum(&compressed)?;
+        self.raw_buf.resize(compressed_size, 0);
+        self.rdr.read_exact(&mut self.raw_buf)?;
+        header.validate_fast_checksum(&self.raw_buf)?;
 
         match header.compress_algo {
-            CompressAlgo::NONE => Ok(compressed),
+            CompressAlgo::NONE => {
+                out[..compressed_size].copy_from_slice(&self.raw_buf);
+                Ok(compressed_size)
+            }
             #[cfg(feature = "zstd")]
             CompressAlgo::ZSTD => {
-                let mut out = vec![0u8; data_size_limit];
-                let len = zstd::bulk::decompress_to_buffer(&compressed, &mut out)?;
-                out.truncate(len);
-                Ok(out)
+                let len = zstd::bulk::decompress_to_buffer(&self.raw_buf, out)?;
+                Ok(len)
             }
             #[cfg(feature = "lzma")]
-            CompressAlgo::LZMA => {
-                let mut out = vec![0u8; data_size_limit];
-                (|| {
-                    let mut stream = xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
-                    let st = stream.process(&compressed, &mut out, xz2::stream::Action::Run)?;
-                    if stream.total_in() as usize != compressed.len()
-                        || st != xz2::stream::Status::StreamEnd
-                    {
-                        return Err(std::io::Error::new(
-                            ErrorKind::InvalidData,
-                            "LZMA stream did not end cleanly",
-                        ));
-                    }
-                    out.truncate(stream.total_out() as usize);
-                    Ok(())
-                })()?;
-                Ok(out)
-            }
+            CompressAlgo::LZMA => (|| {
+                let mut stream = xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
+                let st = stream.process(&self.raw_buf, out, xz2::stream::Action::Run)?;
+                if stream.total_in() as usize != self.raw_buf.len()
+                    || st != xz2::stream::Status::StreamEnd
+                {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "LZMA stream did not end cleanly",
+                    ));
+                }
+                Ok(stream.total_out() as usize)
+            })()
+            .map_err(Into::into),
             #[cfg(feature = "lz4")]
             CompressAlgo::LZ4 | CompressAlgo::LZ4HC => {
-                let mut out = vec![0u8; data_size_limit];
-                let len = lz4::block::decompress_to_buffer(&compressed, None, &mut out)?;
-                out.truncate(len);
-                Ok(out)
+                let len = lz4::block::decompress_to_buffer(&self.raw_buf, None, out)?;
+                Ok(len)
             }
             // Not supported: FLAC (overlay specific), RICEPP (no much information or library).
             algo => Err(Error::UnknowCompressAlgo(algo)),

@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, Write},
+    io::Write,
     process::{Command, Stdio},
     time::Instant,
 };
@@ -46,7 +46,7 @@ fn main() {
             output,
             check,
         } => {
-            let file = BufReader::new(File::open(input).expect("failed to open input file"));
+            let file = File::open(input).expect("failed to open input file");
             let (index, _) = Archive::new(file).expect("failed to load archive");
             let mut got = <Vec<u8>>::new();
             mtree::dump(&mut got, &index).expect("failed to dump mtree");
@@ -134,21 +134,21 @@ fn main() {
             });
 
             eprintln!("reading contents");
-            let file = BufReader::new(File::open(input).expect("failed to open input file"));
+            let file = File::open(input).expect("failed to open input file");
             let (index, mut archive) = Archive::new(file).expect("failed to load archive");
-            let mut states = check_content::CheckState {
+            let mut state = check_content::CheckState {
                 files: 0,
                 oks: 0,
                 inst: Instant::now(),
                 path,
                 do_check: tmp_dir.is_some(),
             };
-            check_content::traverse_dir(&mut archive, index.root(), &mut states);
-            let elapsed = states.inst.elapsed();
+            check_content::traverse_dir(&mut archive, index.root(), &mut state);
+            let elapsed = state.inst.elapsed();
             eprintln!("completed in {elapsed:?}");
 
-            println!("{}/{} OK", states.oks, states.files);
-            if states.files != states.oks {
+            println!("{}/{} OK", state.oks, state.files);
+            if state.files != state.oks {
                 std::process::exit(1)
             }
         }
