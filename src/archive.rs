@@ -8,6 +8,7 @@ use std::{
 };
 
 use bstr::{BStr, BString, ByteSlice};
+use lru::LruCache;
 
 use crate::{
     bisect_range_by,
@@ -138,6 +139,7 @@ pub struct Config {
     section_index_size_limit: usize,
     metadata_schema_size_limit: usize,
     metadata_size_limit: usize,
+    block_cache_size_limit: usize,
 }
 
 impl Default for Config {
@@ -148,6 +150,8 @@ impl Default for Config {
             section_index_size_limit: 64 << 20,
             metadata_schema_size_limit: 1 << 20,
             metadata_size_limit: 16 << 20,
+            // 32 x 16MiB blocks.
+            block_cache_size_limit: 512 << 20,
         }
     }
 }
@@ -170,6 +174,11 @@ impl Config {
 
     pub fn metadata_size_limit(&mut self, limit: usize) -> &mut Self {
         self.metadata_size_limit = limit;
+        self
+    }
+
+    pub fn block_cache_size_limit(&mut self, limit: usize) -> &mut Self {
+        self.block_cache_size_limit = limit;
         self
     }
 }
@@ -634,18 +643,12 @@ impl ArchiveIndex {
 
 #[derive(Debug)]
 pub struct Archive<R: ?Sized> {
-    cache_bytes: Box<[u8]>,
-    // TODO: LRU cache.
-    cache_entry: BlockCacheEntry,
+    /// LRU cache of block idx -> block content.
+    cache: LruCache<u32, Vec<u8>>,
     image_offset: u64,
+    block_size: u32,
 
     rdr: SectionReader<R>,
-}
-
-#[derive(Debug)]
-struct BlockCacheEntry {
-    section_idx: u32,
-    len: u32,
 }
 
 impl<R: Read + Seek + ?Sized> Archive<R> {
@@ -660,7 +663,7 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
     {
         let mut rdr = SectionReader::new(rdr);
         let index = ArchiveIndex::new(&mut rdr)?;
-        let this = Self::new_with_index_and_config(rdr, &index, &Config::default());
+        let this = Self::new_with_index_and_config(rdr, &index, &Config::default())?;
         Ok((index, this))
     }
 
@@ -668,27 +671,33 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
         rdr: SectionReader<R>,
         index: &ArchiveIndex,
         config: &Config,
-    ) -> Self
+    ) -> Result<Self>
     where
         R: Sized,
     {
         let block_size = index.metadata().block_size;
-        Self {
-            cache_bytes: vec![0u8; block_size as usize].into_boxed_slice(),
-            cache_entry: BlockCacheEntry {
-                section_idx: !0,
-                len: 0,
-            },
+        let cache_len = NonZero::new(config.block_cache_size_limit / block_size as usize)
+            .ok_or_else(|| {
+                let msg = format!(
+                    "block size {}B exceeds cache size limit {}B",
+                    block_size, config.block_cache_size_limit
+                );
+                ErrorInner::Section(msg, None)
+            })?;
+        Ok(Self {
+            cache: LruCache::new(cache_len),
             image_offset: config.image_offset,
+            block_size,
             rdr,
-        }
+        })
     }
 
     /// Cache a block section's content if it's not available yet.
     ///
     /// Calculates file offset, handles cache miss and out-of-range errors on short read.
     fn cache_block(&mut self, index: &ArchiveIndex, section_idx: u32) -> Result<()> {
-        if self.cache_entry.section_idx == section_idx {
+        // NB. Use `get` instead of `contains` to promote it to MRU.
+        if self.cache.get(&section_idx).is_some() {
             log::trace!("block {section_idx}: cache hit");
             return Ok(());
         }
@@ -704,9 +713,17 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
             let header = self.rdr.read_header()?;
             header.check_type(SectionType::BLOCK)?;
 
-            // Block size is in u32 range.
-            let len = self.rdr.read_data_into(&header, &mut self.cache_bytes)? as u32;
-            self.cache_entry = BlockCacheEntry { section_idx, len };
+            // Reuse existing buffer.
+            let mut buf = if self.cache.len() == self.cache.cap().get() {
+                let (_, mut buf) = self.cache.pop_lru().expect("not empty");
+                buf.resize(self.block_size as usize, 0);
+                buf
+            } else {
+                vec![0u8; self.block_size as usize]
+            };
+            let len = self.rdr.read_data_into(&header, &mut buf)? as u32;
+            buf.truncate(len as usize);
+            self.cache.push(section_idx, buf);
 
             Ok(())
         })()
@@ -715,11 +732,10 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
 
     /// Get a chunk inside the most recently cached block.
     fn get_chunk_in_cache(&self, start: u32, end: u32) -> Result<&[u8]> {
-        let cache = &self.cache_bytes[..self.cache_entry.len as usize];
+        let (&section_idx, cache) = self.cache.peek_mru().expect("cache is empty");
         let chunk = cache.get(start as usize..end as usize).ok_or_else(
             #[cold]
             || {
-                let section_idx = self.cache_entry.section_idx;
                 let cache_len = cache.len();
                 let msg = format!(
                     "block {section_idx} has only {cache_len} bytes \

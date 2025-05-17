@@ -14,6 +14,7 @@ lz4 = ["dep:lz4"]
 [dependencies]
 bstr = "1.12.0"
 log = "0.4.27"
+lru = "0.14.0"
 lz4 = { version = "1.28.1", optional = true }
 measure_time = "0.9.0"
 sha2 = "0.10.9"
