@@ -38,6 +38,8 @@ enum Cli {
 
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
+    env_logger::init();
+
     match &cli {
         Cli::Mtree {
             input,

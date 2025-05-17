@@ -13,7 +13,9 @@ lz4 = ["dep:lz4"]
 
 [dependencies]
 bstr = "1.12.0"
+log = "0.4.27"
 lz4 = { version = "1.28.1", optional = true }
+measure_time = "0.9.0"
 sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 xz2 = { version = "0.1.7", optional = true }

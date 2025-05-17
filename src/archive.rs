@@ -667,13 +667,15 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
             .as_ref()
             .is_some_and(|(cache_offset, _)| *cache_offset == archive_offset)
         {
+            log::trace!("block at {archive_offset}: cache hit");
             return Ok(());
         }
 
-        self.rdr.get_mut().seek(SeekFrom::Start(
-            archive_offset.saturating_add(self.image_offset),
-        ))?;
         let data = (|| {
+            measure_time::trace_time!("block at {archive_offset}: cache miss");
+            self.rdr.get_mut().seek(SeekFrom::Start(
+                archive_offset.saturating_add(self.image_offset),
+            ))?;
             let header = self.rdr.read_header()?;
             header.check_type(SectionType::BLOCK)?;
             // `block_size` is checked to be in `usize` range by `validate_post`.
