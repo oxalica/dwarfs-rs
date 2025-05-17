@@ -1,3 +1,29 @@
+#[cfg(feature = "log")]
+#[macro_use(trace_time)]
+extern crate measure_time;
+
+#[cfg(feature = "log")]
+#[macro_use(trace)]
+extern crate log;
+
+#[cfg(not(feature = "log"))]
+#[macro_use]
+mod macros {
+    macro_rules! trace {
+        ($($tt:tt)*) => {
+            let _ = if false {
+                let _ = ::std::format_args!($($tt)*);
+            };
+        };
+    }
+
+    macro_rules! trace_time {
+        ($($tt:tt)*) => {
+            trace!($($tt)*)
+        };
+    }
+}
+
 pub mod archive;
 pub mod fsst;
 pub mod metadata;

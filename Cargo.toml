@@ -6,17 +6,22 @@ description = "WIP"
 license = "MIT OR Apache-2.0"
 
 [features]
-default = ["zstd"]
+default = ["zstd", "log"]
+
+# Compression algorithms support.
 zstd = ["dep:zstd"]
 lzma = ["dep:xz2"]
 lz4 = ["dep:lz4"]
 
+# Extra functionalities.
+log = ["dep:log", "dep:measure_time"]
+
 [dependencies]
 bstr = "1.12.0"
-log = "0.4.27"
+log = { version = "0.4.27", optional = true }
 lru = "0.14.0"
 lz4 = { version = "1.28.1", optional = true }
-measure_time = "0.9.0"
+measure_time = { version = "0.9.0", optional = true }
 sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 xz2 = { version = "0.1.7", optional = true }

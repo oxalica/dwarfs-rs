@@ -236,6 +236,7 @@ impl ArchiveIndex {
         rdr: &mut SectionReader<R>,
         config: &Config,
     ) -> Result<Self> {
+        trace_time!("initialize ArchiveIndex");
         let image_offset = config.image_offset;
 
         // Load section index.
@@ -267,6 +268,8 @@ impl ArchiveIndex {
 
         // Load and unpack metadata.
         let metadata = {
+            trace_time!("parse schema and metadata");
+
             rdr.get_mut().seek(SeekFrom::Start(schema_offset))?;
             let (_, raw_schema) = rdr
                 .read_section(config.metadata_schema_size_limit)
@@ -278,7 +281,11 @@ impl ArchiveIndex {
                 .read_section(config.metadata_size_limit)
                 .context("failed to read metadata section")?;
             let meta = Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::Metadata)?;
-            unpacked::Metadata::from(meta)
+
+            {
+                trace_time!("thraw metadata");
+                unpacked::Metadata::from(meta)
+            }
         };
 
         let mut this = Self {
@@ -296,6 +303,8 @@ impl ArchiveIndex {
 
     /// Validate the section index.
     fn validate_section_index(sections: &[SectionIndexEntry], config: &Config) -> Result<()> {
+        trace_time!("validate section index");
+
         // TODO: This sorted property seems to be undocumented. Need some clarification.
         sections
             .windows(2)
@@ -312,6 +321,7 @@ impl ArchiveIndex {
 
     /// Guard on filesystem features, unpack packed fields, build decoders and validate index ranges.
     fn unpack_validate(&mut self) -> Result<()> {
+        trace_time!("unpack and validate full metadata content");
         let m = &mut self.metadata;
 
         // Explicit future-incompatible features.
@@ -335,6 +345,8 @@ impl ArchiveIndex {
                 .context("timestamp_base overflow")?;
 
             if opts.packed_chunk_table {
+                trace_time!("unpack chunk_table");
+
                 let mut sum = 0u32;
                 for c in &mut m.chunk_table {
                     sum = c
@@ -345,6 +357,8 @@ impl ArchiveIndex {
             }
 
             if opts.packed_directories {
+                trace_time!("unpack directories");
+
                 let mut sum = 0u32;
                 for dir in &mut m.directories {
                     sum = sum
@@ -359,6 +373,8 @@ impl ArchiveIndex {
                 .as_ref()
                 .filter(|_| opts.packed_shared_files_table)
             {
+                trace_time!("unpack shared files");
+
                 let unpacked_len = std::iter::zip(shared, 2..)
                     .try_fold(0u32, |sum, (&cnt, dups)| {
                         cnt.checked_mul(dups)?.checked_add(sum)
@@ -377,6 +393,8 @@ impl ArchiveIndex {
 
         // Inode classification ranges.
         {
+            trace_time!("classify inode types");
+
             // NB. Minus the sentinel.
             let dir_cnt = m.directories.len().saturating_sub(1);
             let file_store_cnt = m.chunk_table.len().saturating_sub(1);
@@ -424,6 +442,8 @@ impl ArchiveIndex {
             msg_symtab: &'static str,
             msg_decode: &'static str,
         ) -> Result<()> {
+            trace_time!("unpack symtab");
+
             let Some(tbl) = tbl else { return Ok(()) };
             let len = tbl.buffer.len() as u32;
             if tbl.packed_index {
@@ -497,6 +517,8 @@ impl ArchiveIndex {
         // Validate contents, mostly about indexes.
         // TODO: Maybe just cache the indirection result?
         {
+            trace_time!("check index and values are in ranges");
+
             macro_rules! check {
                 ($cond:expr, $msg:literal) => {
                     $cond.or_context(concat!("index out of range in ", $msg))?
@@ -698,11 +720,11 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
     fn cache_block(&mut self, index: &ArchiveIndex, section_idx: u32) -> Result<()> {
         // NB. Use `get` instead of `contains` to promote it to MRU.
         if self.cache.get(&section_idx).is_some() {
-            log::trace!("block {section_idx}: cache hit");
+            trace!("block {section_idx}: cache hit");
             return Ok(());
         }
 
-        measure_time::trace_time!("block {section_idx}: cache miss");
+        trace_time!("block {section_idx}: cache miss");
 
         let archive_offset = index.section_index()[section_idx as usize].offset();
         // Checked not to overflow by `ArchiveIndex::validate_section_index`.
