@@ -126,7 +126,7 @@ fn main() {
                 assert!(st.success(), "dwarfsextract exited with an error {st}");
                 eprintln!("extracted in {:?}", inst.elapsed());
             }
-            let path = tmp_dir.as_ref().map_or(String::new(), |p| {
+            let check_path = tmp_dir.as_ref().map(|p| {
                 p.path()
                     .to_str()
                     .expect("temp path is not UTF-8")
@@ -136,19 +136,14 @@ fn main() {
             eprintln!("reading contents");
             let file = File::open(input).expect("failed to open input file");
             let (index, mut archive) = Archive::new(file).expect("failed to load archive");
-            let mut state = check_content::CheckState {
-                files: 0,
-                oks: 0,
-                inst: Instant::now(),
-                path,
-                do_check: tmp_dir.is_some(),
-            };
-            check_content::traverse_dir(&mut archive, index.root(), &mut state);
-            let elapsed = state.inst.elapsed();
+            let inst = Instant::now();
+            let check_content::CheckResult { files, oks } =
+                check_content::traverse_dir(&mut archive, &index, inst, check_path.as_deref());
+            let elapsed = inst.elapsed();
             eprintln!("completed in {elapsed:?}");
 
-            println!("{}/{} OK", state.oks, state.files);
-            if state.files != state.oks {
+            println!("{files}/{oks} OK");
+            if files != oks {
                 std::process::exit(1)
             }
         }
