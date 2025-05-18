@@ -10,7 +10,7 @@ pub fn dump(w: &mut dyn Write, index: &ArchiveIndex) -> Result<()> {
 fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
     for only_dir in [false, true] {
         for ent in dir.entries() {
-            let name = str::from_utf8(ent.name()).expect("entry name is not UTF8");
+            let name = ent.name();
             let ino = ent.inode();
             let prev_len = path.len();
             path.push('/');
@@ -39,8 +39,7 @@ fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
                 } else {
                     let kind = ino.classify();
                     if let InodeKind::Symlink(sym) = kind {
-                        let tgt =
-                            str::from_utf8(sym.target()).expect("symlink target is not UTF-8");
+                        let tgt = sym.target();
                         writeln!(
                             w,
                             "{path} time={mtime}.0 mode={mode:03o} gid={gid} uid={uid} type=link link={tgt}",

@@ -28,7 +28,7 @@ pub fn traverse_dir(
         let prev_len = path.len();
 
         for ent in dir.entries() {
-            let name = str::from_utf8(ent.name()).unwrap();
+            let name = ent.name();
             let ino = ent.inode();
             path.push_str(name);
 

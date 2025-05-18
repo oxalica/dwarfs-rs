@@ -7,7 +7,7 @@ use std::{
     num::NonZero,
 };
 
-use bstr::{BStr, BString, ByteSlice};
+use bstr::BString;
 use lru::LruCache;
 use positioned_io::{ReadAt, Size};
 
@@ -475,7 +475,10 @@ impl ArchiveIndex {
                     let sym_dec_len = FsstDecoder::max_decode_len(sym.len());
                     out_buf.resize(out_len + sym_dec_len, 0);
                     let sym_out = &mut out_buf[out_len..out_len + sym_dec_len];
-                    out_len += decoder.decode_into(sym, sym_out).context(msg_decode)?;
+                    let len = decoder.decode_into(sym, sym_out).context(msg_decode)?;
+                    // Each decoded symbol must be in UTF-8.
+                    str::from_utf8(&sym_out[..len]).ok().context(msg_decode)?;
+                    out_len += len;
 
                     // This is suboptimal, because it *is* possible that the total length of
                     // decoded strings overflows u32, that is 4GiB names compressed into 512MiB.
@@ -486,6 +489,7 @@ impl ArchiveIndex {
                 }
                 debug_assert_eq!(out_index.len(), tbl.index.len());
                 out_buf.truncate(out_len);
+
                 tbl.buffer = out_buf.into();
                 tbl.index = out_index;
             }
@@ -598,14 +602,16 @@ impl ArchiveIndex {
         loose: &'a [BString],
         compact: &'a Option<unpacked::StringTable>,
         idx: u32,
-    ) -> &'a BStr {
-        if let Some(tbl) = compact {
+    ) -> &'a str {
+        let s = if let Some(tbl) = compact {
             let idx_start = tbl.index[idx as usize] as usize;
             let idx_end = tbl.index[idx as usize + 1] as usize;
-            tbl.buffer[idx_start..idx_end].as_bstr()
+            &tbl.buffer[idx_start..idx_end]
         } else {
-            loose[idx as usize].as_bstr()
-        }
+            &loose[idx as usize]
+        };
+        // TODO: Avoid re-validate the whole symbol?
+        str::from_utf8(s).expect("validated")
     }
 
     /// Get the root directory of the archive.
@@ -1004,7 +1010,10 @@ impl<'a> Dir<'a> {
         let iter = self.entries();
         let range = iter.ent_start as usize..iter.ent_end as usize;
         let idx = bisect_range_by(range, |idx| {
-            <[u8] as Ord>::cmp(DirEntry::new(self.index, idx as u32).name(), name)
+            Ord::cmp(
+                DirEntry::new(self.index, idx as u32).name().as_bytes(),
+                name,
+            )
         })?;
         Some(DirEntry::new(self.index, idx as u32))
     }
@@ -1066,7 +1075,7 @@ impl<'a> DirEntry<'a> {
         Self { index, data }
     }
 
-    pub fn name(&self) -> &'a BStr {
+    pub fn name(&self) -> &'a str {
         let m = self.index.metadata();
         ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, self.data.name_index)
     }
@@ -1096,7 +1105,7 @@ impl<'a> From<Symlink<'a>> for Inode<'a> {
 }
 
 impl<'a> Symlink<'a> {
-    pub fn target(&self) -> &'a BStr {
+    pub fn target(&self) -> &'a str {
         let m = self.index.metadata();
         let tgt_idx = m.symlink_table[self.symlink_idx as usize];
         ArchiveIndex::get_from_string_table(&m.symlinks, &m.compact_symlinks, tgt_idx)
