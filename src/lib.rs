@@ -29,6 +29,8 @@ pub mod fsst;
 pub mod metadata;
 pub mod section;
 
+pub use positioned_io;
+
 /// The (included) minimum (major, minor) version this library supports.
 pub const DWARFS_VERSION_MIN: (u8, u8) = (2, 5);
 

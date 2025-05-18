@@ -220,6 +220,7 @@ dependencies = [
  "lru",
  "lz4",
  "measure_time",
+ "positioned-io",
  "sha2",
  "xxhash-rust",
  "xz2",
@@ -480,6 +481,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8a2f0d8d040d7848a709caf78912debcc3f33ee4b3cac47d73d1e1069e83507"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "positioned-io"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8078ce4d22da5e8f57324d985cc9befe40c49ab0507a192d6be9e59584495c9"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]

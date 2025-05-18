@@ -1,9 +1,6 @@
-use std::{
-    io::{Read, Seek},
-    time::Instant,
-};
+use std::time::Instant;
 
-use dwarfs::{Archive, ArchiveIndex, AsChunks};
+use dwarfs::{Archive, ArchiveIndex, AsChunks, positioned_io::ReadAt};
 
 const TIMEOUT_SEC: u64 = 10;
 
@@ -13,8 +10,8 @@ pub struct CheckResult {
     pub oks: u64,
 }
 
-pub fn traverse_dir<R: Read + Seek>(
-    archive: &mut Archive<R>,
+pub fn traverse_dir(
+    archive: &mut Archive<dyn ReadAt>,
     index: &ArchiveIndex,
     inst: Instant,
     check_path: Option<&str>,

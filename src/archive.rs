@@ -2,19 +2,20 @@
 
 use std::{
     fmt,
-    io::{BufRead, Read, Seek, SeekFrom},
+    io::{BufRead, Read},
     iter::FusedIterator,
     num::NonZero,
 };
 
 use bstr::{BStr, BString, ByteSlice};
 use lru::LruCache;
+use positioned_io::{ReadAt, Size};
 
 use crate::{
     bisect_range_by,
     fsst::Decoder as FsstDecoder,
     metadata::{Metadata, MetadataError, Schema, SchemaError, unpacked},
-    section::{SectionIndexEntry, SectionReader, SectionType},
+    section::{HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -135,7 +136,6 @@ impl BoolExt for bool {
 
 #[derive(Debug)]
 pub struct Config {
-    image_offset: u64,
     section_index_size_limit: usize,
     metadata_schema_size_limit: usize,
     metadata_size_limit: usize,
@@ -145,7 +145,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            image_offset: 0,
             // Some arbitrarily chosen numbers.
             section_index_size_limit: 64 << 20,
             metadata_schema_size_limit: 1 << 20,
@@ -157,11 +156,6 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn image_offset(&mut self, offset: u64) -> &mut Self {
-        self.image_offset = offset;
-        self
-    }
-
     pub fn section_index_size_limit(&mut self, limit: usize) -> &mut Self {
         self.section_index_size_limit = limit;
         self
@@ -228,26 +222,37 @@ struct InodeTally {
 }
 
 impl ArchiveIndex {
-    pub fn new<R: Read + Seek>(rdr: &mut SectionReader<R>) -> Result<Self> {
+    pub fn new<R: ReadAt + Size>(rdr: &mut SectionReader<R>) -> Result<Self> {
         Self::new_with_config(rdr, &Config::default())
     }
 
-    pub fn new_with_config<R: Read + Seek>(
+    pub fn new_with_config<R: ReadAt + Size>(
         rdr: &mut SectionReader<R>,
         config: &Config,
     ) -> Result<Self> {
+        let stream_len = rdr.get_ref().size()?.ok_or_else(|| {
+            ErrorInner::Section("cannot get the size of the archive reader".into(), None)
+        })?;
+        Self::new_inner(rdr, stream_len, config)
+    }
+
+    fn new_inner(
+        rdr: &mut SectionReader<dyn ReadAt + '_>,
+        stream_len: u64,
+        config: &Config,
+    ) -> Result<Self> {
         trace_time!("initialize ArchiveIndex");
-        let image_offset = config.image_offset;
 
         // Load section index.
         let (_, section_index) = rdr
-            .seek_read_section_index(image_offset, config.section_index_size_limit)
-            .context("failed to load section index")?;
+            .read_section_index(stream_len, config.section_index_size_limit)
+            .context("failed to load section index")?
+            .expect("TODO: will never return missing section index yet");
         u32::try_from(section_index.len())
             .ok()
             .context("too many sections")?;
         let section_index = section_index.into_boxed_slice();
-        Self::validate_section_index(&section_index, config)?;
+        Self::validate_section_index(&section_index)?;
 
         // Find metadata sections.
         let find_unique_section = |sec_ty: SectionType| -> Result<u64> {
@@ -261,24 +266,20 @@ impl ArchiveIndex {
             }
             Ok(off)
         };
-        let schema_offset =
-            find_unique_section(SectionType::METADATA_V2_SCHEMA)?.saturating_add(image_offset);
-        let metadata_offset =
-            find_unique_section(SectionType::METADATA_V2)?.saturating_add(image_offset);
+        let schema_offset = find_unique_section(SectionType::METADATA_V2_SCHEMA)?;
+        let metadata_offset = find_unique_section(SectionType::METADATA_V2)?;
 
         // Load and unpack metadata.
         let metadata = {
             trace_time!("parse schema and metadata");
 
-            rdr.get_mut().seek(SeekFrom::Start(schema_offset))?;
             let (_, raw_schema) = rdr
-                .read_section(config.metadata_schema_size_limit)
+                .read_section_at(schema_offset, config.metadata_schema_size_limit)
                 .context("failed to read metadata schema section")?;
             let schema = Schema::parse(&raw_schema).map_err(ErrorInner::Schema)?;
 
-            rdr.get_mut().seek(SeekFrom::Start(metadata_offset))?;
             let (_, raw_metadata) = rdr
-                .read_section(config.metadata_size_limit)
+                .read_section_at(metadata_offset, config.metadata_size_limit)
                 .context("failed to read metadata section")?;
             let meta = Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::Metadata)?;
 
@@ -302,7 +303,7 @@ impl ArchiveIndex {
     }
 
     /// Validate the section index.
-    fn validate_section_index(sections: &[SectionIndexEntry], config: &Config) -> Result<()> {
+    fn validate_section_index(sections: &[SectionIndexEntry]) -> Result<()> {
         trace_time!("validate section index");
 
         // TODO: This sorted property seems to be undocumented. Need some clarification.
@@ -311,11 +312,6 @@ impl ArchiveIndex {
             .all(|w| w[0].offset() < w[1].offset())
             .or_context("offsets in section index is not sorted")?;
 
-        if let Some(sec) = sections.last() {
-            sec.offset()
-                .checked_add(config.image_offset)
-                .context("section offset overflow")?;
-        }
         Ok(())
     }
 
@@ -667,22 +663,23 @@ impl ArchiveIndex {
 pub struct Archive<R: ?Sized> {
     /// LRU cache of block idx -> block content.
     cache: LruCache<u32, Vec<u8>>,
-    image_offset: u64,
     block_size: u32,
 
     rdr: SectionReader<R>,
 }
 
-impl<R: Read + Seek + ?Sized> Archive<R> {
+impl<R: ReadAt + Size> Archive<R> {
     /// Load a dwarfs archive (aka. dwarfs image) from a [`Seek`]-able stream,
     /// typically a [`std::fs::File`].
     ///
-    /// Note that you do NOT want [`BufReader`][std::io::BufReader] on the
-    /// stream, because [`Archive`] already has internal caches.
-    pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)>
-    where
-        R: Sized,
-    {
+    /// Note 1: Do not use [`BufReader`][std::io::BufReader], because
+    /// [`Archive`] already has internal caches.
+    ///
+    /// Note 2: It's *discouraged* to use [`positioned_io::RandomAccessFile`] on *NIX
+    /// platforms because that would disable readahead which can hurt performance on
+    /// sequential read inside a several MiB section.
+    /// On Windows, however, `RandomAccessFile` is several times faster than `File`.
+    pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)> {
         let mut rdr = SectionReader::new(rdr);
         let index = ArchiveIndex::new(&mut rdr)?;
         let this = Self::new_with_index_and_config(rdr, &index, &Config::default())?;
@@ -693,10 +690,7 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
         rdr: SectionReader<R>,
         index: &ArchiveIndex,
         config: &Config,
-    ) -> Result<Self>
-    where
-        R: Sized,
-    {
+    ) -> Result<Self> {
         let block_size = index.metadata().block_size;
         let cache_len = NonZero::new(config.block_cache_size_limit / block_size as usize)
             .ok_or_else(|| {
@@ -708,12 +702,13 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
             })?;
         Ok(Self {
             cache: LruCache::new(cache_len),
-            image_offset: config.image_offset,
             block_size,
             rdr,
         })
     }
+}
 
+impl<R: ReadAt + ?Sized> Archive<R> {
     /// Cache a block section's content if it's not available yet.
     ///
     /// Calculates file offset, handles cache miss and out-of-range errors on short read.
@@ -726,13 +721,11 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
 
         trace_time!("block {section_idx}: cache miss");
 
-        let archive_offset = index.section_index()[section_idx as usize].offset();
-        // Checked not to overflow by `ArchiveIndex::validate_section_index`.
-        let file_offset = self.image_offset + archive_offset;
+        let section_offset = index.section_index()[section_idx as usize].offset();
+        let payload_offset = section_offset + HEADER_SIZE;
 
         (|| {
-            self.rdr.get_mut().seek(SeekFrom::Start(file_offset))?;
-            let header = self.rdr.read_header()?;
+            let header = self.rdr.read_header_at(section_offset)?;
             header.check_type(SectionType::BLOCK)?;
 
             // Reuse existing buffer.
@@ -743,8 +736,10 @@ impl<R: Read + Seek + ?Sized> Archive<R> {
             } else {
                 vec![0u8; self.block_size as usize]
             };
-            let len = self.rdr.read_data_into(&header, &mut buf)? as u32;
-            buf.truncate(len as usize);
+            let len = self
+                .rdr
+                .read_payload_at_into(&header, payload_offset, &mut buf)?;
+            buf.truncate(len);
             self.cache.push(section_idx, buf);
 
             Ok(())
@@ -1296,10 +1291,7 @@ impl<'a> Chunk<'a> {
     ///
     /// If the section (block) containing this chunk is already in cache, this
     /// function performs no read on the underlying stream.
-    pub fn read_cached<'b, R: Read + Seek + ?Sized>(
-        &self,
-        archive: &'b mut Archive<R>,
-    ) -> Result<&'b [u8]> {
+    pub fn read_cached<'b, R: ReadAt>(&self, archive: &'b mut Archive<R>) -> Result<&'b [u8]> {
         archive.cache_block(self.index, self.section_idx())?;
         // Chunk offsets will not overflow, checked by `unpack_validate`.
         archive.get_chunk_in_cache(self.offset(), self.offset() + self.size())
@@ -1339,7 +1331,7 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
     /// The user must guarantee the owning [`ArchiveIndex`] of `self` and
     /// `archive` must come from the same dwarfs archive, or the behavior is
     /// unspecified: it may return garbage data, panic, or fail.
-    fn as_reader<'b, R>(&self, archive: &'b mut Archive<R>) -> ChunksReader<'a, 'b, R> {
+    fn as_reader<'b, R: ?Sized>(&self, archive: &'b mut Archive<R>) -> ChunksReader<'a, 'b, R> {
         ChunksReader {
             archive,
             chunks: self.as_chunks(),
@@ -1354,7 +1346,10 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
     /// [`Read::read_to_end`] because it forces an allocation.
     ///
     /// See [`AsChunks::as_reader`] for the validity requirement on `archiev`.
-    fn read_to_vec<R: Read + Seek>(&self, archive: &mut Archive<R>) -> std::io::Result<Vec<u8>> {
+    fn read_to_vec<R: ReadAt + ?Sized>(
+        &self,
+        archive: &mut Archive<R>,
+    ) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         self.as_reader(archive).read_to_end(&mut out)?;
         Ok(out)
@@ -1388,14 +1383,14 @@ fn read_to_end_via_buf_read(
 ///   [`std::io::copy`].
 /// - This implements [`Iterator`] to read in chunks.
 #[derive(Debug)]
-pub struct ChunksReader<'a, 'b, R> {
-    archive: &'b mut Archive<R>,
+pub struct ChunksReader<'a, 'b, R: ?Sized> {
     chunks: ChunkIter<'a>,
     in_section_offset: u32,
     chunk_rest_size: u32,
+    archive: &'b mut Archive<R>,
 }
 
-impl<R> ChunksReader<'_, '_, R> {
+impl<R: ?Sized> ChunksReader<'_, '_, R> {
     /// Iterate over all chunks and return the sum of all chunks' byte length.
     ///
     /// This number is exact, unless the dwarfs archive is changed during access
@@ -1405,7 +1400,7 @@ impl<R> ChunksReader<'_, '_, R> {
     }
 }
 
-impl<R: Read + Seek> Read for ChunksReader<'_, '_, R> {
+impl<R: ReadAt + ?Sized> Read for ChunksReader<'_, '_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let cache = self.fill_buf()?;
         let len = cache.len().min(buf.len());
@@ -1422,7 +1417,7 @@ impl<R: Read + Seek> Read for ChunksReader<'_, '_, R> {
     }
 }
 
-impl<R: Read + Seek> BufRead for ChunksReader<'_, '_, R> {
+impl<R: ReadAt + ?Sized> BufRead for ChunksReader<'_, '_, R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
         if self.chunk_rest_size == 0 {
             let Some(chunk) = self.chunks.next() else {
