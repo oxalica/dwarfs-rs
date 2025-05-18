@@ -156,22 +156,22 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn section_index_size_limit(&mut self, limit: usize) -> &mut Self {
+    pub fn section_index_size_limit(mut self, limit: usize) -> Self {
         self.section_index_size_limit = limit;
         self
     }
 
-    pub fn metadata_schema_size_limit(&mut self, limit: usize) -> &mut Self {
+    pub fn metadata_schema_size_limit(mut self, limit: usize) -> Self {
         self.metadata_schema_size_limit = limit;
         self
     }
 
-    pub fn metadata_size_limit(&mut self, limit: usize) -> &mut Self {
+    pub fn metadata_size_limit(mut self, limit: usize) -> Self {
         self.metadata_size_limit = limit;
         self
     }
 
-    pub fn block_cache_size_limit(&mut self, limit: usize) -> &mut Self {
+    pub fn block_cache_size_limit(mut self, limit: usize) -> Self {
         self.block_cache_size_limit = limit;
         self
     }
@@ -639,6 +639,29 @@ impl ArchiveIndex {
                 Some(inode.as_dir()?.get(name)?.inode())
             })
     }
+
+    pub fn inodes(&self) -> impl ExactSizeIterator<Item = Inode<'_>> + '_ {
+        let cnt = self.metadata().inodes.len() as u32;
+        (0..cnt).map(|inode_num| Inode {
+            index: self,
+            inode_num,
+        })
+    }
+
+    pub fn directories(&self) -> impl ExactSizeIterator<Item = Dir<'_>> + '_ {
+        let cnt = self.inode_tally.symlink_start;
+        (0..cnt).map(|inode_num| Dir {
+            index: self,
+            inode_num,
+        })
+    }
+
+    pub fn get_inode(&self, inode_num: u32) -> Option<Inode<'_>> {
+        (inode_num < self.metadata().inodes.len() as u32).then_some(Inode {
+            index: self,
+            inode_num,
+        })
+    }
 }
 
 /// Low-level methods.
@@ -649,13 +672,6 @@ impl ArchiveIndex {
 
     pub fn metadata(&self) -> &unpacked::Metadata {
         &self.metadata
-    }
-
-    pub fn get_inode(&self, inode_num: u32) -> Option<Inode<'_>> {
-        (inode_num < self.metadata().inodes.len() as u32).then_some(Inode {
-            index: self,
-            inode_num,
-        })
     }
 }
 
@@ -680,9 +696,14 @@ impl<R: ReadAt + Size> Archive<R> {
     /// sequential read inside a several MiB section.
     /// On Windows, however, `RandomAccessFile` is several times faster than `File`.
     pub fn new(rdr: R) -> Result<(ArchiveIndex, Self)> {
+        Self::new_with_config(rdr, &Config::default())
+    }
+
+    /// Same as [`Archive::new`] but with a non-default [`Config`].
+    pub fn new_with_config(rdr: R, config: &Config) -> Result<(ArchiveIndex, Self)> {
         let mut rdr = SectionReader::new(rdr);
         let index = ArchiveIndex::new(&mut rdr)?;
-        let this = Self::new_with_index_and_config(rdr, &index, &Config::default())?;
+        let this = Self::new_with_index_and_config(rdr, &index, config)?;
         Ok((index, this))
     }
 
@@ -790,6 +811,10 @@ pub struct Inode<'a> {
 }
 
 impl<'a> Inode<'a> {
+    pub fn inode_num(&self) -> u32 {
+        self.inode_num
+    }
+
     /// Classify this inode to an enum according to its kind.
     pub fn classify(&self) -> InodeKind<'a> {
         let Self { index, inode_num } = *self;
