@@ -224,7 +224,7 @@ impl Schema {
 }
 
 /// A wrapper of a `Vec<T>` representing a ordered set of ascending `T`.
-#[derive(Default, Clone, PartialEq, Deserialize)]
+#[derive(Default, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(transparent)]
 pub struct OrderedSet<T>(pub Vec<T>);
 
@@ -296,6 +296,15 @@ impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> Deserialize<'de> for Ordered
     }
 }
 
+impl<K: Serialize, V: Serialize> Serialize for OrderedMap<K, V> {
+    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        ser.collect_map(self.0.iter().map(|(k, v)| (k, v)))
+    }
+}
+
 impl<K, V> OrderedMap<K, V> {
     pub fn len(&self) -> usize {
         self.0.len()
@@ -326,7 +335,7 @@ impl Metadata {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct Metadata {
@@ -375,7 +384,7 @@ pub struct Metadata {
     // pub reg_file_size_cache: Option<InodeSizeCache>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct Chunk {
@@ -385,7 +394,7 @@ pub struct Chunk {
     pub size: u32,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct Directory {
@@ -395,7 +404,7 @@ pub struct Directory {
     pub self_entry: u32,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct InodeData {
@@ -412,7 +421,7 @@ pub struct InodeData {
     pub ctime_offset: u32,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct DirEntry {
@@ -421,7 +430,7 @@ pub struct DirEntry {
     pub inode_num: u32,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct FsOptions {
@@ -433,7 +442,7 @@ pub struct FsOptions {
     pub packed_shared_files_table: bool,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct StringTable {
@@ -444,7 +453,7 @@ pub struct StringTable {
     pub packed_index: bool,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
 pub struct InodeSizeCache {
