@@ -1,13 +1,16 @@
 //! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
 use std::{fmt, marker::PhantomData};
 
-use serde::{Deserialize, de};
+use serde::{Deserialize, Serialize, de};
 
 use self::frozen::{FromRaw, Offset, ResultExt as _, Source, Str};
 
 mod frozen;
 mod serde_thrift;
 pub mod unpacked;
+
+#[cfg(test)]
+mod tests;
 
 pub use frozen::{List, ListIter, Map, MapIter, Set, SetIter};
 
@@ -79,6 +82,22 @@ impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for VecMap<T> {
     }
 }
 
+impl<T: Serialize> Serialize for VecMap<T> {
+    fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let size = self.iter().count();
+        let mut ser = ser.serialize_map(Some(size))?;
+        for (k, v) in self.iter() {
+            ser.serialize_entry(&k, v)?;
+        }
+        ser.end()
+    }
+}
+
 impl<T> std::ops::Index<i16> for VecMap<T> {
     type Output = T;
 
@@ -104,37 +123,41 @@ impl<T> VecMap<T> {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct Schema {
-    // NB. Field order matters for the deserializer.
-    #[serde(default)]
+    // NB. Field order matters for ser/de impl.
+    #[serde(default, skip_serializing_if = "is_default")]
     pub relax_type_checks: bool,
     pub layouts: VecMap<SchemaLayout>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub root_layout: i16,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub file_version: i32,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaLayout {
-    // NB. Field order matters for the deserializer.
-    #[serde(default)]
+    // NB. Field order matters for ser/de impl.
+    #[serde(default, skip_serializing_if = "is_default")]
     pub size: i32,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub bits: i16,
     pub fields: VecMap<SchemaField>,
     pub type_name: String,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaField {
-    // NB. Field order matters for the deserializer.
+    // NB. Field order matters for ser/de impl.
     pub layout_id: i16,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     pub offset: i16,
 }
 
@@ -151,6 +174,11 @@ impl Schema {
             .map_err(|err| Error(format!("failed to parse schema: {err}").into()))?;
         this.validate()?;
         Ok(this)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        serde_thrift::serialize_struct(self)
+            .map_err(|err| Error(format!("failed to serialize schema: {err}").into()))
     }
 
     fn validate(&self) -> Result<()> {

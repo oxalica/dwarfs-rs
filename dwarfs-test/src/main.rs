@@ -5,13 +5,22 @@ use std::{
     time::Instant,
 };
 
-use dwarfs::Archive;
+use dwarfs::{
+    Archive,
+    metadata::Schema,
+    section::{SectionReader, SectionType},
+};
 
 mod check_content;
 mod mtree;
 
 #[derive(Debug, clap::Parser)]
 enum Cli {
+    /// Deserialize, serialize, re-deserialize the schema to verify it's the same result.
+    SchemaRoundtrip {
+        /// The input dwarfs archive path.
+        input: String,
+    },
     /// Dump the hierarchy and metadata of a dwarfs archive in "mtree" text format.
     Mtree {
         /// The output file to write. If omitted, stdout is implied.
@@ -41,6 +50,29 @@ fn main() {
     env_logger::init();
 
     match &cli {
+        Cli::SchemaRoundtrip { input, .. } => {
+            let file = File::open(input).expect("failed to open input file");
+            let file_size = file.metadata().expect("failed to get file size").len();
+            let mut rdr = SectionReader::new(file);
+            let (_, sec_index) = rdr
+                .read_section_index(file_size, 16 << 20)
+                .expect("failed to read section index")
+                .expect("missing section index");
+            let offset = sec_index
+                .iter()
+                .find_map(|i| {
+                    (i.section_type() == SectionType::METADATA_V2_SCHEMA).then_some(i.offset())
+                })
+                .expect("missing schema section");
+            let (_, schema_bytes) = rdr
+                .read_section_at(offset, 16 << 20)
+                .expect("failed to read schema");
+
+            let schema1 = Schema::parse(&schema_bytes).expect("failed to parse schema");
+            let schema_ser = schema1.to_bytes().expect("failed to serialize schema");
+            let schema2 = Schema::parse(&schema_ser).expect("failed to reparse schema");
+            assert_eq!(schema1, schema2);
+        }
         Cli::Mtree {
             input,
             output,
