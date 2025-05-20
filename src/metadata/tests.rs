@@ -4,10 +4,10 @@ use super::*;
 fn serde_schema() {
     let schema = Schema {
         relax_type_checks: true,
-        layouts: VecMap(vec![Some(SchemaLayout {
+        layouts: DenseMap(vec![Some(SchemaLayout {
             size: 1,
             bits: 0,
-            fields: VecMap::default(),
+            fields: DenseMap::default(),
             type_name: String::new(),
         })]),
         root_layout: 0,
@@ -44,12 +44,12 @@ fn serde_schema() {
 fn de_frozen() {
     let schema = Schema {
         relax_type_checks: true,
-        layouts: VecMap(vec![
+        layouts: DenseMap(vec![
             None,
             Some(SchemaLayout {
                 size: 0,
                 bits: 8,
-                fields: VecMap(vec![
+                fields: DenseMap(vec![
                     None,
                     Some(SchemaField {
                         layout_id: 2,
@@ -66,7 +66,7 @@ fn de_frozen() {
             Some(SchemaLayout {
                 size: 0,
                 bits: 4,
-                fields: VecMap::default(),
+                fields: DenseMap::default(),
                 type_name: String::new(),
             }),
         ]),

@@ -23,29 +23,22 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A dense map of i16 -> T, stored as `Vec<Option<T>>`.
+/// A dense map of i16 -> T, stored as `Vec<Option<T>>` for quick indexing.
 #[derive(Default, Clone, PartialEq, Eq)]
-pub struct VecMap<T>(pub Vec<Option<T>>);
+pub struct DenseMap<T>(pub Vec<Option<T>>);
 
-impl<T: fmt::Debug> fmt::Debug for VecMap<T> {
+impl<T: fmt::Debug> fmt::Debug for DenseMap<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map()
-            .entries(
-                self.0
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, elem)| Some((idx, elem.as_ref()?))),
-            )
-            .finish()
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
-impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for VecMap<T> {
+impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for DenseMap<T> {
     fn deserialize<D: de::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         struct Visitor<T>(PhantomData<T>);
 
         impl<'de, T: de::Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
-            type Value = VecMap<T>;
+            type Value = DenseMap<T>;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                 f.write_str("a dense map")
@@ -70,7 +63,7 @@ impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for VecMap<T> {
                     }
                     vecmap[k] = Some(v);
                 }
-                Ok(VecMap(vecmap))
+                Ok(DenseMap(vecmap))
             }
         }
 
@@ -78,7 +71,7 @@ impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for VecMap<T> {
     }
 }
 
-impl<T: Serialize> Serialize for VecMap<T> {
+impl<T: Serialize> Serialize for DenseMap<T> {
     fn serialize<S>(&self, ser: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -94,7 +87,7 @@ impl<T: Serialize> Serialize for VecMap<T> {
     }
 }
 
-impl<T> ops::Index<i16> for VecMap<T> {
+impl<T> ops::Index<i16> for DenseMap<T> {
     type Output = T;
 
     fn index(&self, index: i16) -> &Self::Output {
@@ -102,8 +95,8 @@ impl<T> ops::Index<i16> for VecMap<T> {
     }
 }
 
-impl<T> VecMap<T> {
-    fn is_empty(&self) -> bool {
+impl<T> DenseMap<T> {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -125,7 +118,7 @@ pub struct Schema {
     // NB. Field order matters for ser/de impl.
     #[serde(default, skip_serializing_if = "is_default")]
     pub relax_type_checks: bool,
-    pub layouts: VecMap<SchemaLayout>,
+    pub layouts: DenseMap<SchemaLayout>,
     #[serde(default, skip_serializing_if = "is_default")]
     pub root_layout: i16,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -140,7 +133,7 @@ pub struct SchemaLayout {
     pub size: i32,
     #[serde(default, skip_serializing_if = "is_default")]
     pub bits: i16,
-    pub fields: VecMap<SchemaField>,
+    pub fields: DenseMap<SchemaField>,
     pub type_name: String,
 }
 
