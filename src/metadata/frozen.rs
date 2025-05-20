@@ -20,7 +20,7 @@ use bstr::BStr;
 
 use crate::{
     bisect_range_by,
-    metadata::schema::{Schema, SchemaLayout},
+    metadata::{Schema, SchemaLayout},
 };
 
 /// The offset type we use to index into metadata bytes.
@@ -37,6 +37,7 @@ fn to_usize(offset: Offset) -> usize {
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug)]
 pub struct Error(Box<ErrorInner>);
 
 #[derive(Debug)]
@@ -45,20 +46,12 @@ struct ErrorInner {
     context: String,
 }
 
-impl fmt::Debug for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.0.msg)?;
         f.write_str(&self.0.context)
     }
 }
-
-impl std::error::Error for Error {}
 
 impl From<&'static str> for Error {
     #[cold]
@@ -190,13 +183,13 @@ impl<'a> Source<'a> {
         self,
         mut base_bit: Offset,
         layout: &SchemaLayout,
-        field_id: u16,
+        field_id: i16,
     ) -> Result<T> {
-        let Some(f) = layout.field(field_id) else {
+        let Some(f) = layout.fields.get(field_id) else {
             return Ok(T::empty(self));
         };
         base_bit += Offset::from(f.offset_bits());
-        let layout = &self.schema[f.layout_id];
+        let layout = &self.schema.layouts[f.layout_id];
         self.load(base_bit, layout)
     }
 }
@@ -206,7 +199,7 @@ macro_rules! impl_int_from_raw {
         $(impl<'a> FromRaw<'a> for $i {
             fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
                 assert!(layout.fields.is_empty());
-                let v = src.load_bits(base_bit, layout.bits)?;
+                let v = src.load_bits(base_bit, layout.bits as u16)?;
                 Ok(Self::try_from(v).ok().ok_or(concat!("integer overflow for ", stringify!($i)))?)
             }
             fn empty(_: Source<'a>) -> Self {
@@ -293,7 +286,7 @@ struct RawList<'a> {
     /// The rebased location for element storage.
     elem_src: Source<'a>,
     len: Offset,
-    elem_layout_id: u16,
+    elem_layout_id: i16,
     elem_bits: u16,
 }
 
@@ -320,7 +313,7 @@ impl<'a> RawList<'a> {
         }
         // We already checked this does not overflow in `RawList::load`.
         let base_bit = (idx as Offset) * Offset::from(self.elem_bits);
-        let layout = &self.elem_src.schema[self.elem_layout_id];
+        let layout = &self.elem_src.schema.layouts[self.elem_layout_id];
         self.elem_src.load(base_bit, layout)
     }
 
@@ -332,9 +325,9 @@ impl<'a> RawList<'a> {
 impl<'a> FromRaw<'a> for RawList<'a> {
     fn load(src: Source<'a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self> {
         let (distance, count) = src.load::<(Offset, Offset)>(base_bit, layout)?;
-        let elem_layout_id = layout.field(3).map(|f| f.layout_id);
+        let elem_layout_id = layout.fields.get(3).map(|f| f.layout_id);
         let elem_src = src.rebase(distance)?;
-        let elem_bits = elem_layout_id.map_or(0, |lid| src.schema[lid].bits);
+        let elem_bits = elem_layout_id.map_or(0, |lid| src.schema.layouts[lid].bits as u16);
         Offset::from(elem_bits)
             .checked_mul(count)
             .filter(|&bit_len| to_usize(bit_len.div_ceil(8)) <= elem_src.bytes.len())

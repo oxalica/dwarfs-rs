@@ -221,6 +221,7 @@ dependencies = [
  "lz4",
  "measure_time",
  "positioned-io",
+ "serde",
  "sha2",
  "xxhash-rust",
  "xz2",

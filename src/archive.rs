@@ -14,7 +14,7 @@ use positioned_io::{ReadAt, Size};
 use crate::{
     bisect_range_by,
     fsst::Decoder as FsstDecoder,
-    metadata::{Metadata, MetadataError, Schema, SchemaError, unpacked},
+    metadata::{Error as ParserMetadataError, Metadata, Schema, unpacked},
     section::{HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
 
@@ -31,8 +31,7 @@ enum ErrorInner {
     Section(String, Option<crate::section::Error>),
     MissingSection(SectionType),
     DuplicatedSection(SectionType),
-    Schema(SchemaError),
-    Metadata(MetadataError),
+    ParseMetadata(ParserMetadataError),
     UnsupportedFeature(String),
     Validation(&'static str),
     Io(std::io::Error),
@@ -52,8 +51,7 @@ impl fmt::Display for Error {
             ErrorInner::MissingSection(ty) => write!(f, "missing section {ty:?}"),
             ErrorInner::DuplicatedSection(ty) => write!(f, "duplicated sections {ty:?}"),
             ErrorInner::Io(err) => write!(f, "input/outpur error: {err}"),
-            ErrorInner::Schema(err) => write!(f, "invalid metadata schema: {err}"),
-            ErrorInner::Metadata(err) => write!(f, "failed to parse metadata: {err}"),
+            ErrorInner::ParseMetadata(err) => write!(f, "failed to parse metadata: {err}"),
             ErrorInner::Validation(err) => write!(f, "malformed metadata: {err}"),
             ErrorInner::UnsupportedFeature(msg) => write!(f, "unsupported feature: {msg}"),
         }
@@ -65,8 +63,7 @@ impl std::error::Error for Error {
         match &*self.0 {
             ErrorInner::Section(_, Some(err)) => Some(err),
             ErrorInner::Io(err) => Some(err),
-            ErrorInner::Schema(err) => Some(err),
-            ErrorInner::Metadata(err) => Some(err),
+            ErrorInner::ParseMetadata(err) => Some(err),
             _ => None,
         }
     }
@@ -276,12 +273,13 @@ impl ArchiveIndex {
             let (_, raw_schema) = rdr
                 .read_section_at(schema_offset, config.metadata_schema_size_limit)
                 .context("failed to read metadata schema section")?;
-            let schema = Schema::parse(&raw_schema).map_err(ErrorInner::Schema)?;
+            let schema = Schema::parse(&raw_schema).map_err(ErrorInner::ParseMetadata)?;
 
             let (_, raw_metadata) = rdr
                 .read_section_at(metadata_offset, config.metadata_size_limit)
                 .context("failed to read metadata section")?;
-            let meta = Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::Metadata)?;
+            let meta =
+                Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::ParseMetadata)?;
 
             {
                 trace_time!("thraw metadata");

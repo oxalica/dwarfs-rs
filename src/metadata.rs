@@ -1,27 +1,208 @@
 //! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
 use std::{fmt, marker::PhantomData};
 
+use serde::{Deserialize, de};
+
 use self::frozen::{FromRaw, Offset, ResultExt as _, Source, Str};
-use self::schema::SchemaLayout;
 
 mod frozen;
-mod schema;
+mod serde_thrift;
 pub mod unpacked;
 
-pub use frozen::{Error as MetadataError, List, ListIter, Map, MapIter, Set, SetIter};
-pub use schema::OpaqueError as SchemaError;
+pub use frozen::{List, ListIter, Map, MapIter, Set, SetIter};
 
-pub struct Schema(schema::Schema);
+type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl fmt::Debug for Schema {
+#[derive(Debug)]
+pub struct Error(Box<str>);
+
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
+impl std::error::Error for Error {}
+
+/// A dense map of i16 -> T, stored as `Vec<Option<T>>`.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct VecMap<T>(pub Vec<Option<T>>);
+
+impl<T: fmt::Debug> fmt::Debug for VecMap<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, elem)| Some((idx, elem.as_ref()?))),
+            )
+            .finish()
+    }
+}
+
+impl<'de, T: de::Deserialize<'de>> de::Deserialize<'de> for VecMap<T> {
+    fn deserialize<D: de::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        struct Visitor<T>(PhantomData<T>);
+
+        impl<'de, T: de::Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
+            type Value = VecMap<T>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a dense map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                // Keys start at 1.
+                let len = map.size_hint().unwrap_or(0) + 1;
+                let mut vecmap = Vec::with_capacity(len);
+                while let Some((k, v)) = map.next_entry::<i16, T>()? {
+                    let k = usize::try_from(k).map_err(|_| {
+                        de::Error::invalid_value(
+                            de::Unexpected::Signed(k.into()),
+                            &"an unsigned dense map key",
+                        )
+                    })?;
+                    if vecmap.len() <= k {
+                        vecmap.resize_with(k + 1, || None);
+                    }
+                    vecmap[k] = Some(v);
+                }
+                Ok(VecMap(vecmap))
+            }
+        }
+
+        de.deserialize_map(Visitor::<T>(PhantomData))
+    }
+}
+
+impl<T> std::ops::Index<i16> for VecMap<T> {
+    type Output = T;
+
+    fn index(&self, index: i16) -> &Self::Output {
+        self.get(index).expect("index out of bound")
+    }
+}
+
+impl<T> VecMap<T> {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn get(&self, i: i16) -> Option<&T> {
+        self.0.get(usize::try_from(i).ok()?)?.as_ref()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (i16, &T)> + use<'_, T> {
+        self.0
+            .iter()
+            .enumerate()
+            .filter_map(|(k, v)| Some((k as i16, v.as_ref()?)))
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct Schema {
+    // NB. Field order matters for the deserializer.
+    #[serde(default)]
+    pub relax_type_checks: bool,
+    pub layouts: VecMap<SchemaLayout>,
+    #[serde(default)]
+    pub root_layout: i16,
+    #[serde(default)]
+    pub file_version: i32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct SchemaLayout {
+    // NB. Field order matters for the deserializer.
+    #[serde(default)]
+    pub size: i32,
+    #[serde(default)]
+    pub bits: i16,
+    pub fields: VecMap<SchemaField>,
+    pub type_name: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
+pub struct SchemaField {
+    // NB. Field order matters for the deserializer.
+    pub layout_id: i16,
+    #[serde(default)]
+    pub offset: i16,
+}
+
+impl SchemaField {
+    fn offset_bits(&self) -> u16 {
+        let o = self.offset;
+        if o >= 0 { o as u16 * 8 } else { (-o) as u16 }
+    }
+}
+
 impl Schema {
-    pub fn parse(src: &[u8]) -> Result<Self, SchemaError> {
-        Ok(Self(schema::parse_schema(src)?))
+    pub fn parse(input: &[u8]) -> Result<Self> {
+        let this = serde_thrift::deserialize_struct::<Self>(input)
+            .map_err(|err| Error(format!("failed to parse schema: {err}").into()))?;
+        this.validate()?;
+        Ok(this)
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.validate_inner()
+            .map_err(|msg| Error(msg.into_boxed_str()))
+    }
+
+    fn validate_inner(&self) -> Result<(), String> {
+        const FILE_VERSION: i32 = 1;
+
+        if self.file_version != FILE_VERSION {
+            return Err(format!(
+                "unsupported schema file_version {:?}",
+                self.file_version
+            ));
+        }
+        if self.layouts.get(self.root_layout).is_none() {
+            return Err("missing root_layout".into());
+        }
+
+        for (layout_id, layout) in self.layouts.iter() {
+            if layout.fields.is_empty() && layout.bits > 64 {
+                return Err(format!(
+                    "layout {}: primitive type is too large to have {}bits",
+                    layout_id, layout.bits,
+                ));
+            }
+
+            for (field_id, field) in layout.fields.iter() {
+                (|| -> Result<(), &str> {
+                    let field_layout = self
+                        .layouts
+                        .get(field.layout_id)
+                        .ok_or("layout index out of range")?;
+                    let bit_offset = if field.offset >= 0 {
+                        field.offset.checked_mul(8)
+                    } else {
+                        field.offset.checked_neg()
+                    };
+                    if field_layout.bits < 0 {
+                        return Err("layout bits cannot be negative");
+                    }
+                    let bit_total_size = bit_offset
+                        .and_then(|off| (off as u16).checked_add(field_layout.bits as u16));
+                    bit_total_size.ok_or("offset overflows")?;
+                    Ok(())
+                })()
+                .map_err(|err| format!("field {field_id} of layout {layout_id}: {err}"))?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -49,7 +230,7 @@ macro_rules! define_value_struct {
             }
 
             impl<$a> FromRaw<$a> for $name<$a> {
-                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self, MetadataError> {
+                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self, frozen::Error> {
                     Ok(Self {
                         $($field: src.load_field(base_bit, layout, $field_id)
                             .context(concat!(stringify!($name), ".", stringify!($field)))?,)*
@@ -80,13 +261,15 @@ macro_rules! define_value_struct {
 }
 
 impl<'a> Metadata<'a> {
-    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self, MetadataError> {
-        let src = Source {
-            schema: &schema.0,
-            bytes,
-        };
-        let layout = &src.schema[src.schema.root_layout];
+    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self> {
+        if cfg!(debug_assertions) {
+            schema.validate().expect("invalid schema");
+        }
+
+        let src = Source { schema, bytes };
+        let layout = &src.schema.layouts[src.schema.root_layout];
         src.load(0, layout)
+            .map_err(|err| Error(err.to_string().into_boxed_str()))
     }
 }
 
