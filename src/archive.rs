@@ -14,7 +14,7 @@ use positioned_io::{ReadAt, Size};
 use crate::{
     bisect_range_by,
     fsst::Decoder as FsstDecoder,
-    metadata::{Error as ParserMetadataError, Metadata, Schema, unpacked},
+    metadata::{self, Error as ParserMetadataError, Metadata, Schema, StringTable},
     section::{HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
 
@@ -176,7 +176,7 @@ impl Config {
 
 pub struct ArchiveIndex {
     section_index: Box<[SectionIndexEntry]>,
-    metadata: unpacked::Metadata,
+    metadata: Metadata,
 
     mtime_only: bool,
     time_resolution: NonZero<u32>,
@@ -278,13 +278,7 @@ impl ArchiveIndex {
             let (_, raw_metadata) = rdr
                 .read_section_at(metadata_offset, config.metadata_size_limit)
                 .context("failed to read metadata section")?;
-            let meta =
-                Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::ParseMetadata)?;
-
-            {
-                trace_time!("thraw metadata");
-                unpacked::Metadata::from(meta)
-            }
+            Metadata::parse(&schema, &raw_metadata).map_err(ErrorInner::ParseMetadata)?
         };
 
         let mut this = Self {
@@ -431,7 +425,7 @@ impl ArchiveIndex {
 
         // Unpack string tables, currently `compact_{names,symlinks}`.
         fn unpack_string_table(
-            tbl: &mut Option<unpacked::StringTable>,
+            tbl: &mut Option<StringTable>,
             msg_index: &'static str,
             msg_symtab: &'static str,
             msg_decode: &'static str,
@@ -598,7 +592,7 @@ impl ArchiveIndex {
 
     fn get_from_string_table<'a>(
         loose: &'a [BString],
-        compact: &'a Option<unpacked::StringTable>,
+        compact: &'a Option<StringTable>,
         idx: u32,
     ) -> &'a str {
         let s = if let Some(tbl) = compact {
@@ -674,7 +668,7 @@ impl ArchiveIndex {
         &self.section_index
     }
 
-    pub fn metadata(&self) -> &unpacked::Metadata {
+    pub fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 }
@@ -924,7 +918,7 @@ impl<'a> InodeKind<'a> {
 #[derive(Debug)]
 pub struct InodeMetadata<'a> {
     index: &'a ArchiveIndex,
-    data: unpacked::InodeData,
+    data: metadata::InodeData,
 }
 
 impl<'a> InodeMetadata<'a> {
@@ -1063,7 +1057,7 @@ impl FusedIterator for DirEntryIter<'_> {}
 #[derive(Debug)]
 pub struct DirEntry<'a> {
     index: &'a ArchiveIndex,
-    data: unpacked::DirEntry,
+    data: metadata::DirEntry,
 }
 
 impl<'a> DirEntry<'a> {
@@ -1292,7 +1286,7 @@ impl<'a> AsChunks<'a> for SharedFile<'a> {
 #[derive(Debug, Clone)]
 pub struct Chunk<'a> {
     index: &'a ArchiveIndex,
-    data: unpacked::Chunk,
+    data: metadata::Chunk,
     // For `HasChunks` impl.
     chunk_idx: u32,
 }

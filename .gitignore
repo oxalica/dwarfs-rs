@@ -1,6 +1,7 @@
 /target
 result
 result-*
+*.dwarfs
 
 perf*.data*
 flamegraph*.svg

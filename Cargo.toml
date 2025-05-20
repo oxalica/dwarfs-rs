@@ -17,7 +17,7 @@ lz4 = ["dep:lz4"]
 log = ["dep:log", "dep:measure_time"]
 
 [dependencies]
-bstr = "1.12.0"
+bstr = { version = "1.12.0", features = ["serde"] }
 log = { version = "0.4.27", optional = true }
 lru = "0.14.0"
 lz4 = { version = "1.28.1", optional = true }

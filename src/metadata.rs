@@ -1,18 +1,14 @@
 //! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
-use std::{fmt, marker::PhantomData};
+use std::{borrow::Borrow, fmt, marker::PhantomData, ops};
 
+use bstr::BString;
 use serde::{Deserialize, Serialize, de};
 
-use self::frozen::{FromRaw, Offset, ResultExt as _, Source, Str};
-
-mod frozen;
+mod serde_frozen;
 mod serde_thrift;
-pub mod unpacked;
 
 #[cfg(test)]
 mod tests;
-
-pub use frozen::{List, ListIter, Map, MapIter, Set, SetIter};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -98,7 +94,7 @@ impl<T: Serialize> Serialize for VecMap<T> {
     }
 }
 
-impl<T> std::ops::Index<i16> for VecMap<T> {
+impl<T> ops::Index<i16> for VecMap<T> {
     type Output = T;
 
     fn index(&self, index: i16) -> &Self::Output {
@@ -234,165 +230,232 @@ impl Schema {
     }
 }
 
-macro_rules! define_value_struct {
-    (__getter [] $($tt:tt)*) => {};
-    (__getter [$vis:vis] [$($meta:tt)*] $($tt:tt)*) => {
-        $($meta)*
-        $vis $($tt)*
-    };
-    ($(
-        $(#[$meta:meta])*
-        $vis:vis struct $name:ident<$a:lifetime> {
-            $(
-                $(#[$field_meta:meta])*
-                $([$getter_vis:tt])?
-                $field:ident : $field_ty:ty = $field_id:literal,
-            )*
-        }
-    )*) => {
-        $(
-            $(#[$meta])*
-            $vis struct $name<$a> {
-                $($field : $field_ty,)*
-                _marker: PhantomData<&$a [u8]>,
-            }
+/// A wrapper of a `Vec<T>` representing a ordered set of ascending `T`.
+#[derive(Default, Clone, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub struct OrderedSet<T>(pub Vec<T>);
 
-            impl<$a> FromRaw<$a> for $name<$a> {
-                fn load(src: Source<$a>, base_bit: Offset, layout: &SchemaLayout) -> Result<Self, frozen::Error> {
-                    Ok(Self {
-                        $($field: src.load_field(base_bit, layout, $field_id)
-                            .context(concat!(stringify!($name), ".", stringify!($field)))?,)*
-                        _marker: PhantomData,
-                    })
-                }
-
-                fn empty(src: Source<$a>) -> Self {
-                    Self {
-                        $($field: FromRaw::empty(src),)*
-                        _marker: PhantomData,
-                    }
-                }
-            }
-
-            impl<$a> $name<$a> {
-                $(define_value_struct! {
-                    __getter
-                    [$($getter_vis)?]
-                    [$(#[$field_meta])*]
-                    fn $field(&self) -> $field_ty {
-                        self.$field
-                    }
-                })*
-            }
-        )*
-    };
-}
-
-impl<'a> Metadata<'a> {
-    pub fn parse(schema: &'a Schema, bytes: &'a [u8]) -> Result<Self> {
-        if cfg!(debug_assertions) {
-            schema.validate().expect("invalid schema");
-        }
-
-        let src = Source { schema, bytes };
-        let layout = &src.schema.layouts[src.schema.root_layout];
-        src.load(0, layout)
-            .map_err(|err| Error(err.to_string().into_boxed_str()))
+impl<T: fmt::Debug> fmt::Debug for OrderedSet<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(&self.0).finish()
     }
 }
 
-define_value_struct! {
-    #[derive(Debug)]
-    pub struct Metadata<'a> {
-        [pub] chunks: List<'a, Chunk<'a>> = 1,
-        [pub] directories: List<'a, Directory<'a>> = 2,
-        [pub] inodes: List<'a, InodeData<'a>> = 3,
-        [pub] chunk_table: List<'a, u32> = 4,
-        #[deprecated = "deprecated since dwarfs 2.3"]
-        [pub] entry_table: List<'a, u32> = 5,
-        [pub] symlink_table: List<'a, u32> = 6,
-        [pub] uids: List<'a, u32> = 7,
-        [pub] gids: List<'a, u32> = 8,
-        [pub] modes: List<'a, u32> = 9,
-        [pub] names: List<'a, Str<'a>> = 10,
-        [pub] symlinks: List<'a, Str<'a>> = 11,
-        [pub] timestamp_base: u64 = 12,
-        [pub] chunk_inode_offset: u32 = 13,
-        [pub] link_inode_offset: u32 = 14,
-        [pub] block_size: u32 = 15,
-        [pub] total_fs_size: u64 = 16,
-        [pub] devices: Option<List<'a, u64>> = 17,
-
-        [pub] options: Option<FsOptions<'a>> = 18,
-        [pub] dir_entries: Option<List<'a, DirEntry<'a>>> = 19,
-        [pub] shared_files_table: Option<List<'a, u32>> = 20,
-        [pub] total_hardlink_size: Option<u64> = 21,
-        [pub] dwarfs_version: Option<Str<'a>> = 22,
-        [pub] create_timestamp: Option<u64> = 23,
-        [pub] compact_names: Option<StringTable<'a>> = 24,
-        [pub] compact_symlinks: Option<StringTable<'a>> = 25,
-        [pub] preferred_path_separator: Option<u32> = 26,
-        [pub] features: Option<Set<'a, Str<'a>>> = 27,
-        [pub] category_names: Option<List<'a, Str<'a>>> = 28,
-        [pub] block_categories: Option<List<'a, Str<'a>>> = 29,
-        [pub] reg_file_size_cache: Option<InodeSizeCache<'a>> = 30,
+impl<T> OrderedSet<T> {
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct Chunk<'a> {
-        [pub] block: u32 = 1,
-        [pub] offset: u32 = 2,
-        [pub] size: u32 = 3,
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct Directory<'a> {
-        [pub] parent_entry: u32 = 1,
-        [pub] first_entry: u32 = 2,
-        [pub] self_entry: u32 = 3,
+    pub fn contains<Q>(&self, value: &Q) -> bool
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        self.0
+            .binary_search_by(|probe| Ord::cmp(probe.borrow(), value))
+            .is_ok()
+    }
+}
+
+/// A wrapper of a `Vec<(K, V)>` representing a ordered map of ascending key `K`.
+#[derive(Default, Clone, PartialEq)]
+pub struct OrderedMap<K, V>(pub Vec<(K, V)>);
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for OrderedMap<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map()
+            .entries(self.0.iter().map(|(k, v)| (k, v)))
+            .finish()
+    }
+}
+
+impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> Deserialize<'de> for OrderedMap<K, V> {
+    fn deserialize<D>(de: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor<K, V>(PhantomData<(K, V)>);
+
+        impl<'de, K: Deserialize<'de>, V: Deserialize<'de>> de::Visitor<'de> for Visitor<K, V> {
+            type Value = OrderedMap<K, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a map")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut v = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(pair) = map.next_entry()? {
+                    v.push(pair);
+                }
+                Ok(OrderedMap(v))
+            }
+        }
+
+        de.deserialize_map(Visitor::<K, V>(PhantomData))
+    }
+}
+
+impl<K, V> OrderedMap<K, V> {
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct InodeData<'a> {
-        [pub] mode_index: u32 = 2,
-        [pub] owner_index: u32 = 4,
-        [pub] group_index: u32 = 5,
-        [pub] atime_offset: u32 = 6,
-        [pub] mtime_offset: u32 = 7,
-        [pub] ctime_offset: u32 = 8,
-
-        #[deprecated = "deprecated since dwarfs 2.3"]
-        [pub] name_index: u32 = 1,
-        #[deprecated = "deprecated since dwarfs 2.3"]
-        [pub] inode: u32 = 3,
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct DirEntry<'a> {
-        [pub] name_index: u32 = 1,
-        [pub] inode_num: u32 = 2,
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q> + Ord,
+        Q: Ord + ?Sized,
+    {
+        let i = self
+            .0
+            .binary_search_by(|(probe, _)| Ord::cmp(probe.borrow(), key))
+            .ok()?;
+        Some(&self.0[i].1)
     }
+}
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct FsOptions<'a> {
-        [pub] mtime_only: bool = 1,
-        [pub] time_resolution_sec: Option<u32> = 2,
-        [pub] packed_chunk_table: bool = 3,
-        [pub] packed_directories: bool = 4,
-        [pub] packed_shared_files_table: bool = 5,
+impl Metadata {
+    /// Parse the metadata from on-disk serialized form, using the given schema.
+    pub fn parse(schema: &Schema, bytes: &[u8]) -> Result<Self> {
+        serde_frozen::deserialize(schema, bytes)
+            .map_err(|err| Error(format!("failed to parse metadata: {err}").into()))
     }
+}
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct StringTable<'a> {
-        [pub] buffer: Str<'a> = 1,
-        [pub] symtab: Option<Str<'a>> = 2,
-        [pub] index: List<'a, u32> = 3,
-        [pub] packed_index: bool = 4,
-    }
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct Metadata {
+    // NB. Field order matters for ser/de impl.
+    // #1
+    pub chunks: Vec<Chunk>,
+    pub directories: Vec<Directory>,
+    pub inodes: Vec<InodeData>,
+    pub chunk_table: Vec<u32>,
+    #[deprecated = "deprecated since dwarfs 2.3"]
+    pub entry_table: Vec<u32>,
+    pub symlink_table: Vec<u32>,
+    pub uids: Vec<u32>,
+    pub gids: Vec<u32>,
+    pub modes: Vec<u32>,
+    pub names: Vec<BString>,
+    pub symlinks: Vec<BString>,
+    pub timestamp_base: u64,
 
-    #[derive(Debug, Clone, Copy)]
-    pub struct InodeSizeCache<'a> {
-        [pub] lookup: Map<'a, u32, u64> = 1,
-        [pub] min_chunk_count: u64 = 2,
-    }
+    // #13
+    pub chunk_inode_offset: u32,
+    pub link_inode_offset: u32,
+
+    // #15
+    pub block_size: u32,
+    pub total_fs_size: u64,
+
+    // #17
+    pub devices: Option<Vec<u64>>,
+    pub options: Option<FsOptions>,
+
+    // #19
+    pub dir_entries: Option<Vec<DirEntry>>,
+    pub shared_files_table: Option<Vec<u32>>,
+    pub total_hardlink_size: Option<u64>,
+    pub dwarfs_version: Option<BString>,
+    pub create_timestamp: Option<u64>,
+    pub compact_names: Option<StringTable>,
+    pub compact_symlinks: Option<StringTable>,
+
+    // #26
+    pub preferred_path_separator: Option<u32>,
+    pub features: Option<OrderedSet<BString>>,
+    pub category_names: Option<Vec<BString>>,
+    pub block_categories: Option<Vec<BString>>,
+    // pub reg_file_size_cache: Option<InodeSizeCache>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct Chunk {
+    // NB. Field order matters for ser/de impl.
+    pub block: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct Directory {
+    // NB. Field order matters for ser/de impl.
+    pub parent_entry: u32,
+    pub first_entry: u32,
+    pub self_entry: u32,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct InodeData {
+    // NB. Field order matters for ser/de impl.
+    #[deprecated = "deprecated since dwarfs 2.3"]
+    pub name_index: u32,
+    pub mode_index: u32,
+    #[deprecated = "deprecated since dwarfs 2.3"]
+    pub inode: u32,
+    pub owner_index: u32,
+    pub group_index: u32,
+    pub atime_offset: u32,
+    pub mtime_offset: u32,
+    pub ctime_offset: u32,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct DirEntry {
+    // NB. Field order matters for ser/de impl.
+    pub name_index: u32,
+    pub inode_num: u32,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct FsOptions {
+    // NB. Field order matters for ser/de impl.
+    pub mtime_only: bool,
+    pub time_resolution_sec: Option<u32>,
+    pub packed_chunk_table: bool,
+    pub packed_directories: bool,
+    pub packed_shared_files_table: bool,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct StringTable {
+    // NB. Field order matters for ser/de impl.
+    pub buffer: BString,
+    pub symtab: Option<BString>,
+    pub index: Vec<u32>,
+    pub packed_index: bool,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
+#[serde(default)]
+pub struct InodeSizeCache {
+    // NB. Field order matters for ser/de impl.
+    pub lookup: OrderedMap<u32, u64>,
+    pub min_chunk_count: u64,
 }

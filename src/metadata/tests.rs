@@ -39,3 +39,56 @@ fn serde_schema() {
     let got = Schema::parse(&bytes).unwrap();
     assert_eq!(got, schema);
 }
+
+#[test]
+fn de_frozen() {
+    let schema = Schema {
+        relax_type_checks: true,
+        layouts: VecMap(vec![
+            None,
+            Some(SchemaLayout {
+                size: 0,
+                bits: 8,
+                fields: VecMap(vec![
+                    None,
+                    Some(SchemaField {
+                        layout_id: 2,
+                        offset: 0,
+                    }),
+                    None,
+                    Some(SchemaField {
+                        layout_id: 2,
+                        offset: -4,
+                    }),
+                ]),
+                type_name: String::new(),
+            }),
+            Some(SchemaLayout {
+                size: 0,
+                bits: 4,
+                fields: VecMap::default(),
+                type_name: String::new(),
+            }),
+        ]),
+        root_layout: 1,
+        file_version: 1,
+    };
+
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    struct Pair {
+        a: u32,
+        #[serde(default)]
+        b: u32,
+        c: u32,
+    }
+
+    let de = super::serde_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
+    assert_eq!(
+        de,
+        Pair {
+            a: 0x2,
+            b: 0,
+            c: 0x4
+        }
+    );
+}
