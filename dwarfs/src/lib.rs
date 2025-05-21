@@ -24,6 +24,12 @@ mod macros {
     }
 }
 
+macro_rules! bail {
+    ($err:expr $(,)?) => {
+        return Err(Into::into($err))
+    };
+}
+
 pub mod archive;
 pub mod fsst;
 pub mod metadata;

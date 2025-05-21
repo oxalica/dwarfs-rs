@@ -15,7 +15,7 @@ use crate::{
     bisect_range_by,
     fsst::Decoder as FsstDecoder,
     metadata::{self, Error as ParserMetadataError, Metadata, Schema, StringTable},
-    section::{HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
+    section::{self, HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -28,7 +28,7 @@ mod sealed {
 
 #[derive(Debug)]
 enum ErrorInner {
-    Section(String, Option<crate::section::Error>),
+    Section(String, Option<section::Error>),
     MissingSection(SectionType),
     DuplicatedSection(SectionType),
     ParseMetadata(ParserMetadataError),
@@ -94,7 +94,7 @@ trait ResultExt<T> {
     fn context(self, msg: impl fmt::Display) -> Result<T>;
 }
 
-impl<T> ResultExt<T> for Result<T, crate::section::Error> {
+impl<T> ResultExt<T> for Result<T, section::Error> {
     #[inline]
     fn context(self, msg: impl fmt::Display) -> Result<T> {
         match self {

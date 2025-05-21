@@ -1,3 +1,19 @@
+//! The low-level module for accessing sections in a DwarFS image.
+//!
+//! A DwarFS image consists of several sections. Sections for storing raw file
+//! data are also called blocks. Each section consists of a [`Header`] and
+//! maybe-compressed section payload bytes. The maximum uncompressed payload
+//! length of each data section is the block-size, which is by default 16MiB.
+//! Other non-block sections may be smaller or larger, but should still be
+//! small enough to store in memory.
+//!
+//! See [`SectionReader`] for APIs to read sections. In general, functions
+//! returning section headers will always validate the DwarFS version marked in
+//! the header is supported, and functions returning section payloads will
+//! always validate the fast XXH3 checksum against the header before return.
+//!
+//! See also:
+//! [DwarFS File System Format v2.5](https://github.com/mhx/dwarfs/blob/66b80efd0f47209c2d85c95c8af9f078436b6554/doc/dwarfs-format.md)
 use std::{fmt, mem::offset_of};
 
 use positioned_io::ReadAt;
@@ -6,71 +22,104 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_e
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// An error raised from reading, validating, or decompressiong sections.
+pub struct Error(Box<ErrorInner>);
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
-pub enum Error {
-    InvalidMagic,
-    MalformedSectionIndex(String),
+enum ErrorInner {
+    // Header.
+    InvalidMagic([u8; 6]),
+    UnsupportedVersion(u8, u8),
     LengthMismatch,
     ChecksumMismatch,
     OffsetOverflow,
-    UnknowCompressAlgo(CompressAlgo),
-    SectionTypeMismatch {
+
+    // Payload.
+    UnsupportedCompressAlgo(CompressAlgo),
+    TypeMismatch {
         expect: SectionType,
         got: SectionType,
     },
-    SectionPayloadTooLong(usize),
+    PayloadTooLong {
+        limit: usize,
+        got: u64,
+    },
+    Decompress(std::io::Error),
+
+    // Other.
+    MalformedSectionIndex(String),
     Io(std::io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad(match self {
-            Error::InvalidMagic => "invalid section magic",
-            Error::MalformedSectionIndex(msg) => {
-                return write!(f, "malformed section index: {msg}");
+        match &*self.0 {
+            ErrorInner::InvalidMagic(magic) => {
+                write!(f, "invalid section magic: b\"{}\"", magic.escape_ascii())
             }
-            Error::LengthMismatch => "section payload length mismatch",
-            Error::ChecksumMismatch => "section checksum mismatch",
-            Error::OffsetOverflow => "section offset overflow",
-            Error::UnknowCompressAlgo(algo) => {
-                return write!(f, "unknown section compress algorithm {algo:?}");
+            ErrorInner::UnsupportedVersion(maj, min) => {
+                write!(f, "unsupported section version: DWARFS{maj}.{min}")
             }
-            Error::SectionTypeMismatch { expect, got } => {
-                return write!(
+            ErrorInner::LengthMismatch => f.pad("section payload length mismatch"),
+            ErrorInner::ChecksumMismatch => f.pad("section checksum mismatch"),
+            ErrorInner::OffsetOverflow => f.pad("section offset overflow"),
+
+            ErrorInner::UnsupportedCompressAlgo(algo) => {
+                write!(f, "unsupported section compress algorithm {algo:?}")
+            }
+            ErrorInner::TypeMismatch { expect, got } => {
+                write!(
                     f,
                     "section type mismatch, expect {expect:?} but got {got:?}"
-                );
+                )
             }
-            Error::SectionPayloadTooLong(cap) => {
-                return write!(
+            ErrorInner::PayloadTooLong { limit, got } => {
+                write!(
                     f,
-                    "section payload is too long, exceeding the limit of {cap} bytes"
-                );
+                    "section payload has {got} bytes, exceeding the limit of {limit} bytes"
+                )
             }
+            ErrorInner::Decompress(err) => write!(f, "failed to decompress section payload: {err}"),
 
-            Error::Io(err) => return err.fmt(f),
-        })
+            ErrorInner::MalformedSectionIndex(msg) => {
+                write!(f, "malformed section index: {msg}")
+            }
+            ErrorInner::Io(err) => err.fmt(f),
+        }
     }
 }
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        if let Error::Io(err) = self {
-            Some(err)
-        } else {
-            None
+        match &*self.0 {
+            ErrorInner::Decompress(err) | ErrorInner::Io(err) => Some(err),
+            _ => None,
         }
     }
 }
 
 impl From<std::io::Error> for Error {
+    #[cold]
     fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
+        Self(Box::new(ErrorInner::Io(err)))
     }
 }
 
-pub const HEADER_SIZE: u64 = size_of::<Header>() as u64;
+impl From<ErrorInner> for Error {
+    #[cold]
+    fn from(err: ErrorInner) -> Self {
+        Self(Box::new(err))
+    }
+}
+
+pub(crate) const HEADER_SIZE: u64 = size_of::<Header>() as u64;
 
 /// The section (aka. block) header.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -110,16 +159,15 @@ impl Header {
     /// Validate section checksum of header and payload using the "fast" XXH3-64 hash.
     pub fn validate_fast_checksum(&self, payload: &[u8]) -> Result<()> {
         if payload.len() as u64 != self.payload_size.get() {
-            return Err(Error::LengthMismatch);
+            bail!(ErrorInner::LengthMismatch);
         }
         let mut h = Xxh3Default::new();
         h.update(&self.as_bytes()[offset_of!(Self, section_number)..]);
         h.update(payload);
-        if h.digest() == u64::from_le_bytes(self.fast_hash) {
-            Ok(())
-        } else {
-            Err(Error::ChecksumMismatch)
+        if h.digest() != u64::from_le_bytes(self.fast_hash) {
+            bail!(ErrorInner::ChecksumMismatch);
         }
+        Ok(())
     }
 
     /// Validate section checksum of header and payload using the "slow" SHA2-512/256 hash.
@@ -127,33 +175,35 @@ impl Header {
         use sha2::Digest;
 
         if payload.len() as u64 != self.payload_size.get() {
-            return Err(Error::LengthMismatch);
+            bail!(ErrorInner::LengthMismatch);
         }
         let mut h = sha2::Sha512_256::new();
         h.update(&self.as_bytes()[offset_of!(Self, fast_hash)..]);
         h.update(payload);
-        if h.finalize()[..] == self.slow_hash {
-            Ok(())
-        } else {
-            Err(Error::ChecksumMismatch)
+        if h.finalize()[..] != self.slow_hash {
+            bail!(ErrorInner::ChecksumMismatch);
         }
+        Ok(())
     }
 
     /// Check if this section header has the expected section type.
     pub(crate) fn check_type(&self, expect: SectionType) -> Result<()> {
-        (self.section_type == expect)
-            .then_some(())
-            .ok_or(Error::SectionTypeMismatch {
+        if self.section_type != expect {
+            bail!(ErrorInner::TypeMismatch {
                 expect,
                 got: self.section_type,
-            })
+            });
+        }
+        Ok(())
     }
 
     fn payload_size_limited(&self, limit: usize) -> Result<usize> {
-        usize::try_from(self.payload_size.get())
-            .ok()
-            .filter(|&n| n <= limit)
-            .ok_or(Error::SectionPayloadTooLong(limit))
+        let size = self.payload_size.get();
+        if let Some(size) = usize::try_from(size).ok().filter(|&n| n <= limit) {
+            Ok(size)
+        } else {
+            bail!(ErrorInner::PayloadTooLong { limit, got: size })
+        }
     }
 }
 
@@ -161,8 +211,11 @@ impl Header {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct MagicVersion {
+    /// The section magic that should match [MagicVersion::MAGIC].
     pub magic: [u8; 6],
+    /// The format major version.
     pub major: u8,
+    /// The format minor version.
     pub minor: u8,
 }
 
@@ -180,16 +233,16 @@ impl MagicVersion {
     /// The expected magic.
     pub const MAGIC: [u8; 6] = *b"DWARFS";
 
-    /// Validate if the magic matches and the format version is compatible with this library.
+    /// Validate if the magic matches and the format version is supported by this library.
     pub fn validate(self) -> Result<()> {
         let ver = (self.major, self.minor);
-        if self.magic == Self::MAGIC
-            && crate::DWARFS_VERSION_MIN <= ver
-            && ver <= crate::DWARFS_VERSION_MAX
-        {
+        if self.magic != Self::MAGIC {
+            bail!(ErrorInner::InvalidMagic(self.magic));
+        }
+        if crate::DWARFS_VERSION_MIN <= ver && ver <= crate::DWARFS_VERSION_MAX {
             Ok(())
         } else {
-            Err(Error::InvalidMagic)
+            bail!(ErrorInner::UnsupportedVersion(ver.0, ver.1))
         }
     }
 }
@@ -227,11 +280,12 @@ impl_open_enum! {
 
     /// A block of data.
     BLOCK = 0,
-    /// The schema used to layout the [`Self::METADATA_V2`] block contents.
+    /// The schema used to layout on-disk format of Metadata, see [`crate::metadata::Schema`].
     METADATA_V2_SCHEMA = 7,
-    /// The bulk of the root metadata.
+    /// The bulk of the root metadata, see [`crate::metadata::Metadata`].
     METADATA_V2 = 8,
     /// The index of all sections. This must be the last section if present.
+    /// It must not be compressed.
     SECTION_INDEX = 9,
     /// File system history information.
     HISTORY = 10,
@@ -244,13 +298,23 @@ pub struct CompressAlgo(pub le::U16);
 
 impl_open_enum! {
     CompressAlgo; le::U16::new;
+
+    /// Not compressed.
     NONE = 0,
+    /// LZMA, aka `.xz` compression. Supported via feature `lzma`.
     LZMA = 1,
+    /// Zstd compression. Supported via feature `zstd`.
     ZSTD = 2,
+    /// LZ4 compression. Supported via feature `lz4`.
     LZ4 = 3,
+    /// LZ4 compression in HC (high-compression) mode. It can be decompressed as normal LZ4.
+    /// Supported via feature `lz4`.
     LZ4HC = 4,
+    /// Brotli compression. Supported via feature `brotli`.
     BROTLI = 5,
+    /// FLAC compression. Not supported.
     FLAC = 6,
+    /// Rice++ compression. Not supported.
     RICEPP = 7,
 }
 
@@ -270,12 +334,16 @@ impl fmt::Debug for SectionIndexEntry {
 
 impl SectionIndexEntry {
     /// The type of the section this entry is referring to.
+    #[must_use]
+    #[inline]
     pub fn section_type(self) -> SectionType {
-        SectionType((self.0 >> 48).try_into().unwrap())
+        SectionType((self.0 >> 48).try_into().expect("must not overflow u16"))
     }
 
     /// The offset of the section this entry is referring to,
     /// relative to the first section.
+    #[must_use]
+    #[inline]
     pub fn offset(self) -> u64 {
         self.0.get() & ((1u64 << 48) - 1)
     }
@@ -285,6 +353,7 @@ impl SectionIndexEntry {
 ///
 /// The inner type should implement [`positioned_io::ReadAt`] to support
 /// efficient random access. Typically, [`std::fs::File`] should be used.
+/// You do NOT need additional buffering.
 ///
 /// Note: It's *discouraged* to use [`positioned_io::RandomAccessFile`] on *NIX
 /// platforms because that would disable readahead which can hurt performance on
@@ -294,7 +363,7 @@ pub struct SectionReader<R: ?Sized> {
     /// The offset of the start of the dwarfs image, which is added to all
     /// operation offsets.
     image_offset: u64,
-    /// The temporarly buffer for raw compressed section payload.
+    /// The temporary buffer for raw compressed section payload.
     /// It is stored only for allocation reuse. This struct is still state-less.
     raw_buf: Vec<u8>,
     rdr: R,
@@ -339,14 +408,23 @@ impl<R> SectionReader<R> {
 }
 
 impl<R: ?Sized> SectionReader<R> {
+    /// Get a reference to the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn get_ref(&self) -> &R {
         &self.rdr
     }
 
+    /// Get a mutable reference to the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.rdr
     }
 
+    /// Retrieve the ownership of the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn into_inner(self) -> R
     where
         R: Sized,
@@ -356,6 +434,9 @@ impl<R: ?Sized> SectionReader<R> {
 }
 
 impl<R: ReadAt + ?Sized> SectionReader<R> {
+    /// Get the `image_offset` set on creation.
+    #[inline]
+    #[must_use]
     pub fn image_offset(&self) -> u64 {
         self.image_offset
     }
@@ -380,7 +461,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         let file_offset = self
             .image_offset
             .checked_add(section_offset)
-            .ok_or(Error::OffsetOverflow)?;
+            .ok_or(ErrorInner::OffsetOverflow)?;
         let mut header = Header::new_zeroed();
         // For overflowing case, the read must fail because `HEADER_SIZE >= 2`.
         self.rdr.read_exact_at(file_offset, header.as_mut_bytes())?;
@@ -418,7 +499,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         let file_offset = self
             .image_offset
             .checked_add(payload_offset)
-            .ok_or(Error::OffsetOverflow)?;
+            .ok_or(ErrorInner::OffsetOverflow)?;
 
         let size_limit = out.len();
         let compressed_size = header.payload_size_limited(size_limit)?;
@@ -434,7 +515,8 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
             }
             #[cfg(feature = "zstd")]
             CompressAlgo::ZSTD => {
-                let len = zstd::bulk::decompress_to_buffer(raw_buf, out)?;
+                let len = zstd::bulk::decompress_to_buffer(raw_buf, out)
+                    .map_err(ErrorInner::Decompress)?;
                 Ok(len)
             }
             #[cfg(feature = "lzma")]
@@ -444,21 +526,22 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 if stream.total_in() as usize != raw_buf.len()
                     || st != xz2::stream::Status::StreamEnd
                 {
-                    return Err(std::io::Error::new(
+                    bail!(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "LZMA stream did not end cleanly",
                     ));
                 }
                 Ok(stream.total_out() as usize)
             })()
-            .map_err(Into::into),
+            .map_err(|err| ErrorInner::Decompress(err).into()),
             #[cfg(feature = "lz4")]
             CompressAlgo::LZ4 | CompressAlgo::LZ4HC => {
-                let len = lz4::block::decompress_to_buffer(raw_buf, None, out)?;
+                let len = lz4::block::decompress_to_buffer(raw_buf, None, out)
+                    .map_err(ErrorInner::Decompress)?;
                 Ok(len)
             }
             // Not supported: FLAC (overlay specific), RICEPP (no much information or library).
-            algo => Err(Error::UnknowCompressAlgo(algo)),
+            algo => Err(ErrorInner::UnsupportedCompressAlgo(algo).into()),
         }
     }
 
@@ -482,7 +565,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
 
         if stream_len < HEADER_SIZE + INDEX_ENTRY_SIZE64 {
             // TODO: Should this return `Ok(None)` instead?
-            return Err(Error::MalformedSectionIndex(format!(
+            bail!(ErrorInner::MalformedSectionIndex(format!(
                 "file size {stream_len}B is too small for an index"
             )));
         }
@@ -493,7 +576,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         let index_offset = last_entry.offset();
 
         if last_entry.section_type() != SectionType::SECTION_INDEX {
-            return Err(Error::MalformedSectionIndex(format!(
+            bail!(ErrorInner::MalformedSectionIndex(format!(
                 "wrong section type: {:?}",
                 last_entry.section_type(),
             )));
@@ -505,12 +588,12 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 .checked_sub(HEADER_SIZE)
                 .filter(|size| *size > 0)
         })() else {
-            return Err(Error::MalformedSectionIndex(format!(
+            bail!(ErrorInner::MalformedSectionIndex(format!(
                 "invalid offset {index_offset} with no possible space for payload",
             )));
         };
         if payload_size % INDEX_ENTRY_SIZE64 != 0 {
-            return Err(Error::MalformedSectionIndex(format!(
+            bail!(ErrorInner::MalformedSectionIndex(format!(
                 "payload size {payload_size}B is not a multiple of index entries"
             )));
         }
@@ -522,7 +605,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
             || header.payload_size != payload_size
             || u64::from(header.section_number.get()) != num_sections - 1
         {
-            return Err(Error::MalformedSectionIndex(format!(
+            bail!(ErrorInner::MalformedSectionIndex(format!(
                 "invalid section index header: expect correct type, no compression, \
                 payload size {}B, section number {}, got: {:?}",
                 payload_size,
@@ -533,7 +616,10 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
 
         // Header is valid. Now read the index.
         if payload_size > payload_size_limit as u64 {
-            return Err(Error::SectionPayloadTooLong(payload_size_limit));
+            bail!(ErrorInner::PayloadTooLong {
+                got: payload_size,
+                limit: payload_size_limit
+            });
         }
         // The payload size does not overflow `usize`, so it / 8 must also does not.
         let mut buf =
