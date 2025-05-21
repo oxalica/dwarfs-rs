@@ -19,8 +19,8 @@ fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
             let meta = ino.metadata();
             let mtime = meta.mtime();
             let mode = meta.mode() & 0o777;
-            let gid = meta.group();
-            let uid = meta.owner();
+            let gid = meta.gid();
+            let uid = meta.uid();
             if let Some(d) = ino.as_dir() {
                 if only_dir {
                     writeln!(

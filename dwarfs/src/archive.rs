@@ -1,4 +1,6 @@
 //! The high-level interface for accessing a DwarFS archive.
+//!
+//! See [`Archive`] and [`ArchiveIndex`].
 
 use std::{
     fmt,
@@ -18,8 +20,10 @@ use crate::{
     section::{self, HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
 
+/// Type alias using [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An error raised from parsing or accessing [`Archive`].
 pub struct Error(Box<ErrorInner>);
 
 mod sealed {
@@ -131,7 +135,8 @@ impl BoolExt for bool {
     }
 }
 
-#[derive(Debug)]
+/// Configurations and parameters for [`Archive`] and [`ArchiveIndex`].
+#[derive(Debug, Clone)]
 pub struct Config {
     section_index_size_limit: usize,
     metadata_schema_size_limit: usize,
@@ -142,38 +147,93 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Some arbitrarily chosen numbers.
-            section_index_size_limit: 64 << 20,
-            metadata_schema_size_limit: 1 << 20,
-            metadata_size_limit: 16 << 20,
-            // 32 x 16MiB blocks.
+            // Some arbitrarily chosen numbers. Keep in sync with methods docs below!
+            section_index_size_limit: 2 << 20,
+            metadata_schema_size_limit: 16 << 10,
+            metadata_size_limit: 64 << 20,
+            // From `dwarfsextract`: 32 x 16MiB (default size) blocks.
             block_cache_size_limit: 512 << 20,
         }
     }
 }
 
 impl Config {
-    pub fn section_index_size_limit(mut self, limit: usize) -> Self {
+    /// Set the size limit for section index [`SECTION_INDEX`](SectionType::SECTION_INDEX).
+    ///
+    /// The default value is 2MiB. The section index is never compressed,
+    /// and will be kept in memory in [`ArchiveIndex`].
+    ///
+    /// Each section occupies 8bytes in the index. Assuming the default block
+    /// size 16MiB and 10% compression ratio, the default limit corresponds to
+    /// 40TiB files compressed into an 4TiB archive, which is enough for typical use.
+    pub fn section_index_size_limit(&mut self, limit: usize) -> &mut Self {
         self.section_index_size_limit = limit;
         self
     }
 
-    pub fn metadata_schema_size_limit(mut self, limit: usize) -> Self {
+    /// Set the size limit for metadata schema section [`METADATA_V2_SCHEMA`](SectionType::METADATA_V2_SCHEMA).
+    ///
+    /// The default value is 16KiB. It limits both compressed and decompressed size,
+    /// and is only used in duration of parsing metadata.
+    ///
+    /// The size of schema is almost constant and is typically <2KiB in practice.
+    pub fn metadata_schema_size_limit(&mut self, limit: usize) -> &mut Self {
         self.metadata_schema_size_limit = limit;
         self
     }
 
-    pub fn metadata_size_limit(mut self, limit: usize) -> Self {
+    /// Set the size limit for metadata section [`METADATA_V2`](SectionType::METADATA_V2).
+    ///
+    /// The default value is 64MiB. It limits both compressed and decompressed size,
+    /// and will be kept in memory in [`ArchiveIndex`].
+    /// Note that this does NOT count bit-packing and delta-packing. The memory
+    /// footprint can be more than 8 times the packed size, though it is hardly
+    /// achievable in practice.
+    ///
+    /// The size of metadata scales linearly with the directory hierarchy,
+    /// number of inodes, and the total file name and symlink length.
+    /// Packed metadata may be smaller.
+    ///
+    /// As a reference, the DwarFS archive of Linux 6.7 source tree has metadata
+    /// size of 2.2MiB, which is 1.4% of the 152MiB archive.
+    /// You may want to increase this limit for larger archive.
+    pub fn metadata_size_limit(&mut self, limit: usize) -> &mut Self {
         self.metadata_size_limit = limit;
         self
     }
 
-    pub fn block_cache_size_limit(mut self, limit: usize) -> Self {
+    /// The size limit for LRU cache of decompressed data blocks.
+    ///
+    /// The default value is 512MiB. This also serves as a block size limit,
+    /// because the cache must be able to contain at least one block.
+    ///
+    /// Block cache size is highly related with performance. For highly
+    /// fragmented files, a too small block cache can severely hurt performance
+    /// to more than 10x slower.
+    ///
+    /// For extraction from archive, sorting file locations
+    /// ([`Chunk::section_idx`]) before read can improve locality and mitigate
+    /// the drawback of a small cache. But for random access (like FUSE), a
+    /// larger cache is always preferred.
+    pub fn block_cache_size_limit(&mut self, limit: usize) -> &mut Self {
         self.block_cache_size_limit = limit;
         self
     }
 }
 
+/// The index of a DwarFS archive representing the whole hierarchy.
+///
+/// This struct is immutable, and is separated from [`Archive`] for easier
+/// lifetime management.
+///
+/// Use [`Archive::new`] to parse and create a pair of [`ArchiveIndex`] and
+/// [`Archive`].
+///
+/// You usually start at [`ArchiveIndex::root`] to get the root directory in the
+/// archive and walking or searching on the directory tree. [`File`] content can
+/// be read via [`AsChunks`], or by manually iterating its [`Chunk`]s and
+/// invokes [`Chunk::read_cached`]. You need to supply `&mut Archive`
+/// corresponding to this index only when reading file contents.
 pub struct ArchiveIndex {
     section_index: Box<[SectionIndexEntry]>,
     metadata: Metadata,
@@ -219,10 +279,10 @@ struct InodeTally {
 }
 
 impl ArchiveIndex {
-    pub fn new<R: ReadAt + Size>(rdr: &mut SectionReader<R>) -> Result<Self> {
-        Self::new_with_config(rdr, &Config::default())
-    }
-
+    /// Parse and create the index of a DwarFS archive.
+    ///
+    /// This is a low-level methods. Usually you should use [`Archive::new`] to
+    /// get a pair of [`ArchiveIndex`] and [`Archive`] instead.
     pub fn new_with_config<R: ReadAt + Size>(
         rdr: &mut SectionReader<R>,
         config: &Config,
@@ -607,6 +667,8 @@ impl ArchiveIndex {
     }
 
     /// Get the root directory of the archive.
+    #[inline]
+    #[must_use]
     pub fn root(&self) -> Dir<'_> {
         Dir {
             index: self,
@@ -627,6 +689,7 @@ impl ArchiveIndex {
     /// let baz2: Inode<'_> = index.root().get("src")?.inode().as_dir()?.get("lib.rs")?.inode();
     /// # None }
     /// ```
+    #[must_use]
     pub fn get_path<I>(&self, path: I) -> Option<Inode<'_>>
     where
         I: IntoIterator,
@@ -638,7 +701,10 @@ impl ArchiveIndex {
             })
     }
 
-    pub fn inodes(&self) -> impl ExactSizeIterator<Item = Inode<'_>> + '_ {
+    /// Get an iterator over all inodes in the archive, in ascending inode number.
+    #[inline]
+    #[must_use]
+    pub fn inodes(&self) -> impl ExactSizeIterator<Item = Inode<'_>> + DoubleEndedIterator + '_ {
         let cnt = self.metadata().inodes.len() as u32;
         (0..cnt).map(|inode_num| Inode {
             index: self,
@@ -646,7 +712,10 @@ impl ArchiveIndex {
         })
     }
 
-    pub fn directories(&self) -> impl ExactSizeIterator<Item = Dir<'_>> + '_ {
+    /// Get an iterator over all directory inodes in the archive, in ascending inode number.
+    #[inline]
+    #[must_use]
+    pub fn directories(&self) -> impl ExactSizeIterator<Item = Dir<'_>> + DoubleEndedIterator + '_ {
         let cnt = self.inode_tally.symlink_start;
         (0..cnt).map(|inode_num| Dir {
             index: self,
@@ -654,25 +723,39 @@ impl ArchiveIndex {
         })
     }
 
+    /// Lookup an inode by its inode number.
+    #[inline]
+    #[must_use]
     pub fn get_inode(&self, inode_num: u32) -> Option<Inode<'_>> {
         (inode_num < self.metadata().inodes.len() as u32).then_some(Inode {
             index: self,
             inode_num,
         })
     }
-}
 
-/// Low-level methods.
-impl ArchiveIndex {
+    /// Get the low-level section index.
+    #[inline]
+    #[must_use]
     pub fn section_index(&self) -> &[SectionIndexEntry] {
         &self.section_index
     }
 
-    pub fn metadata(&self) -> &Metadata {
+    // NB. The stored metadata is partly unpacked and/or modified.
+    // It may not be a good to expose it.
+    #[inline]
+    #[must_use]
+    fn metadata(&self) -> &Metadata {
         &self.metadata
     }
 }
 
+/// A DwarFS archive wrapping reader `R`.
+///
+/// Usually, you create a pair of [`Archive`] and [`ArchiveIndex`] using
+/// [`Archive::new`]. Directory hierarchy traversal can be done only on
+/// `ArchiveIndex`, and this struct is only needed for reading file content.
+///
+/// See also [`ArchiveIndex`].
 #[derive(Debug)]
 pub struct Archive<R: ?Sized> {
     /// LRU cache of block idx -> block content.
@@ -683,11 +766,12 @@ pub struct Archive<R: ?Sized> {
 }
 
 impl<R: ReadAt + Size> Archive<R> {
-    /// Load a DwarFS archive from a [`Seek`]-able stream,
+    /// Load a DwarFS archive from a random-access stream,
     /// typically a [`std::fs::File`].
     ///
     /// Note 1: Do not use [`BufReader`][std::io::BufReader], because
-    /// [`Archive`] already has internal caches.
+    /// [`Archive`] already has internal caches. Use
+    /// [`Config::block_cache_size_limit`] to configure its size.
     ///
     /// Note 2: It's *discouraged* to use [`positioned_io::RandomAccessFile`] on *NIX
     /// platforms because that would disable readahead which can hurt performance on
@@ -700,11 +784,12 @@ impl<R: ReadAt + Size> Archive<R> {
     /// Same as [`Archive::new`] but with a non-default [`Config`].
     pub fn new_with_config(rdr: R, config: &Config) -> Result<(ArchiveIndex, Self)> {
         let mut rdr = SectionReader::new(rdr);
-        let index = ArchiveIndex::new(&mut rdr)?;
+        let index = ArchiveIndex::new_with_config(&mut rdr, config)?;
         let this = Self::new_with_index_and_config(rdr, &index, config)?;
         Ok((index, this))
     }
 
+    /// The low-level method for creating an `Archive` with already parsed `ArchiveIndex`.
     pub fn new_with_index_and_config(
         rdr: SectionReader<R>,
         index: &ArchiveIndex,
@@ -785,6 +870,9 @@ impl<R: ReadAt + ?Sized> Archive<R> {
 }
 
 impl<R> Archive<R> {
+    /// Retrieve the ownership of the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn into_inner(self) -> R
     where
         R: Sized,
@@ -792,10 +880,16 @@ impl<R> Archive<R> {
         self.rdr.into_inner()
     }
 
+    /// Get a reference to the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn get_ref(&self) -> &R {
         self.rdr.get_ref()
     }
 
+    /// Get a mutable reference to the underlying reader.
+    #[inline]
+    #[must_use]
     pub fn get_mut(&mut self) -> &mut R {
         self.rdr.get_mut()
     }
@@ -809,11 +903,15 @@ pub struct Inode<'a> {
 }
 
 impl<'a> Inode<'a> {
+    /// Get the inode number.
+    #[inline]
+    #[must_use]
     pub fn inode_num(&self) -> u32 {
         self.inode_num
     }
 
     /// Classify this inode to an enum according to its kind.
+    #[must_use]
     pub fn classify(&self) -> InodeKind<'a> {
         let Self { index, inode_num } = *self;
         let t = &index.inode_tally;
@@ -836,23 +934,32 @@ impl<'a> Inode<'a> {
         }
     }
 
+    /// Shortcut method to check if this is a directory inode.
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         self.classify().is_dir()
     }
 
+    /// Shortcut method to check if this is a regular file inode.
+    #[must_use]
     pub fn is_file(&self) -> bool {
         self.classify().is_file()
     }
 
+    /// Shortcut method to convert to [`Dir`] if it is a directory.
+    #[must_use]
     pub fn as_dir(&self) -> Option<Dir<'a>> {
         self.classify().as_dir()
     }
 
+    /// Shortcut method to convert to [`File`] if it is a regular file.
+    #[must_use]
     pub fn as_file(&self) -> Option<File<'a>> {
         self.classify().as_file()
     }
 
     /// Get the metadata of this inode.
+    #[must_use]
     pub fn metadata(&self) -> InodeMetadata<'a> {
         InodeMetadata::new(self.index, self.inode_num)
     }
@@ -862,10 +969,15 @@ impl<'a> Inode<'a> {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub enum InodeKind<'a> {
+    /// A directory inode.
     Directory(Dir<'a>),
+    /// A symlink inode.
     Symlink(Symlink<'a>),
+    /// A regular file inode.
     File(File<'a>),
+    /// A block or character device inode.
     Device(Device<'a>),
+    /// A pipe or socket inode.
     Ipc(Ipc<'a>),
 }
 
@@ -882,6 +994,9 @@ impl<'a> From<InodeKind<'a>> for Inode<'a> {
 }
 
 impl<'a> InodeKind<'a> {
+    /// Shortcut method to convert to [`Dir`] if it is a directory.
+    #[inline]
+    #[must_use]
     pub fn as_dir(&self) -> Option<Dir<'a>> {
         if let Self::Directory(v) = self {
             Some(*v)
@@ -890,6 +1005,9 @@ impl<'a> InodeKind<'a> {
         }
     }
 
+    /// Shortcut method to convert to [`File`] if it is a regular file.
+    #[inline]
+    #[must_use]
     pub fn as_file(&self) -> Option<File<'a>> {
         if let Self::File(v) = self {
             Some(*v)
@@ -898,24 +1016,23 @@ impl<'a> InodeKind<'a> {
         }
     }
 
-    /// Returns `true` if the inode kind is [`Directory`].
-    ///
-    /// [`Directory`]: InodeKind::Directory
+    /// Shortcut method to check if this is a directory inode.
+    #[inline]
     #[must_use]
     pub fn is_dir(&self) -> bool {
         matches!(self, Self::Directory(..))
     }
 
-    /// Returns `true` if the inode kind is [`File`].
-    ///
-    /// [`File`]: InodeKind::File
+    /// Shortcut method to check if this is a regular file inode.
+    #[inline]
     #[must_use]
     pub fn is_file(&self) -> bool {
         matches!(self, Self::File(..))
     }
 }
 
-#[derive(Debug)]
+/// The metadata of an inode.
+#[derive(Debug, Clone)]
 pub struct InodeMetadata<'a> {
     index: &'a ArchiveIndex,
     data: metadata::InodeData,
@@ -928,36 +1045,53 @@ impl<'a> InodeMetadata<'a> {
     }
 
     /// The mode of the inode, including file types and permissions.
+    #[inline]
+    #[must_use]
     pub fn mode(&self) -> u32 {
         self.index.metadata().modes[self.data.mode_index as usize]
     }
 
     /// The owner user id (uid) of the inode.
-    pub fn owner(&self) -> u32 {
+    #[inline]
+    #[must_use]
+    pub fn uid(&self) -> u32 {
         self.index.metadata().uids[self.data.owner_index as usize]
     }
 
     /// The owner group id (gid) of the inode.
-    pub fn group(&self) -> u32 {
+    #[inline]
+    #[must_use]
+    pub fn gid(&self) -> u32 {
         self.index.metadata().gids[self.data.group_index as usize]
     }
 
+    #[inline]
     fn cvt_time(&self, time_offset: u32) -> u64 {
         self.index.timestamp_base_scaled
             + u64::from(time_offset) * u64::from(self.index.time_resolution.get())
     }
 
     /// The last modified time, in the seconds since UNIX epoch.
+    #[inline]
+    #[must_use]
     pub fn mtime(&self) -> u64 {
         self.cvt_time(self.data.mtime_offset)
     }
 
     /// The last accessed time, in the seconds since UNIX epoch.
+    ///
+    /// Returns `None` if the archive stores no such information.
+    #[inline]
+    #[must_use]
     pub fn atime(&self) -> Option<u64> {
         (!self.index.mtime_only).then(|| self.cvt_time(self.data.atime_offset))
     }
 
     /// The last changed time, in the seconds since UNIX epoch.
+    ///
+    /// Returns `None` if the archive stores no such information.
+    #[inline]
+    #[must_use]
     pub fn ctime(&self) -> Option<u64> {
         (!self.index.mtime_only).then(|| self.cvt_time(self.data.ctime_offset))
     }
@@ -978,13 +1112,15 @@ impl<'a> From<Dir<'a>> for Inode<'a> {
 
 impl<'a> Dir<'a> {
     /// Iterate all entries in this directory, in ascending order of names.
+    #[inline]
+    #[must_use]
     pub fn entries(&self) -> DirEntryIter<'a> {
         let ino = self.inode_num as usize;
         let dirs = &self.index.metadata().directories;
         DirEntryIter {
             index: self.index,
-            ent_start: dirs[ino].first_entry,
-            ent_end: dirs[ino + 1].first_entry,
+            start: dirs[ino].first_entry,
+            end: dirs[ino + 1].first_entry,
         }
     }
 
@@ -994,13 +1130,16 @@ impl<'a> Dir<'a> {
     /// So `get` performs a binary search and the time complexity is
     /// `O(min(L, L0) log N)` where `L` is the max length of entry names, `L0`
     /// is the `name.len()` and `N` is the number of entries in this directory.
+    #[inline]
+    #[must_use]
     pub fn get(&self, name: impl AsRef<[u8]>) -> Option<DirEntry<'a>> {
+        // Manually outline.
         self.get_inner(name.as_ref())
     }
 
     fn get_inner(&self, name: &[u8]) -> Option<DirEntry<'a>> {
         let iter = self.entries();
-        let range = iter.ent_start as usize..iter.ent_end as usize;
+        let range = iter.start as usize..iter.end as usize;
         let idx = bisect_range_by(range, |idx| {
             Ord::cmp(
                 DirEntry::new(self.index, idx as u32).name().as_bytes(),
@@ -1011,50 +1150,95 @@ impl<'a> Dir<'a> {
     }
 }
 
+/// The iterator of directory entries.
 #[derive(Debug, Clone)]
 pub struct DirEntryIter<'a> {
     index: &'a ArchiveIndex,
-    ent_start: u32,
-    ent_end: u32,
+    start: u32,
+    end: u32,
 }
 
-// TODO: More Iterator methods.
-impl<'a> Iterator for DirEntryIter<'a> {
-    type Item = DirEntry<'a>;
+macro_rules! impl_range_iterator {
+    ($iter:ident, $item:ident) => {
+        impl<'a> Iterator for $iter<'a> {
+            type Item = $item<'a>;
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = (self.ent_end - self.ent_start) as usize;
-        (len, Some(len))
-    }
+            #[inline]
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.len(), Some(self.len()))
+            }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.ent_start < self.ent_end {
-            let ent = DirEntry::new(self.index, self.ent_start);
-            self.ent_start += 1;
-            Some(ent)
-        } else {
-            None
+            #[inline]
+            fn next(&mut self) -> Option<Self::Item> {
+                if self.start < self.end {
+                    let ent = $item::new(self.index, self.start);
+                    self.start += 1;
+                    Some(ent)
+                } else {
+                    None
+                }
+            }
+
+            #[inline]
+            fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                if n < self.len() {
+                    self.start += n as u32 + 1;
+                    Some($item::new(self.index, self.start - 1))
+                } else {
+                    self.start = self.end;
+                    None
+                }
+            }
+
+            #[inline]
+            fn count(self) -> usize
+            where
+                Self: Sized,
+            {
+                self.len()
+            }
         }
-    }
-}
 
-impl DoubleEndedIterator for DirEntryIter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.ent_start < self.ent_end {
-            let ent = DirEntry::new(self.index, self.ent_end - 1);
-            self.ent_end -= 1;
-            Some(ent)
-        } else {
-            None
+        impl DoubleEndedIterator for $iter<'_> {
+            #[inline]
+            fn next_back(&mut self) -> Option<Self::Item> {
+                if self.start < self.end {
+                    self.end -= 1;
+                    let ent = $item::new(self.index, self.end);
+                    Some(ent)
+                } else {
+                    None
+                }
+            }
+
+            #[inline]
+            fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+                if n < self.len() {
+                    self.end -= n as u32 + 1;
+                    Some($item::new(self.index, self.end))
+                } else {
+                    self.end = self.start;
+                    None
+                }
+            }
         }
-    }
+
+        impl ExactSizeIterator for $iter<'_> {
+            #[inline]
+            fn len(&self) -> usize {
+                // Never overflows because it's in memory.
+                (self.end - self.start) as usize
+            }
+        }
+
+        impl FusedIterator for $iter<'_> {}
+    };
 }
 
-impl ExactSizeIterator for DirEntryIter<'_> {}
-impl FusedIterator for DirEntryIter<'_> {}
+impl_range_iterator!(DirEntryIter, DirEntry);
 
 /// An entry in a directory.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirEntry<'a> {
     index: &'a ArchiveIndex,
     data: metadata::DirEntry,
@@ -1067,11 +1251,17 @@ impl<'a> DirEntry<'a> {
         Self { index, data }
     }
 
+    /// Get the name of this entry.
+    #[inline]
+    #[must_use]
     pub fn name(&self) -> &'a str {
         let m = self.index.metadata();
         ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, self.data.name_index)
     }
 
+    /// Get the inode of this entry.
+    #[inline]
+    #[must_use]
     pub fn inode(&self) -> Inode<'a> {
         Inode {
             index: self.index,
@@ -1097,6 +1287,9 @@ impl<'a> From<Symlink<'a>> for Inode<'a> {
 }
 
 impl<'a> Symlink<'a> {
+    /// Get the target of this symlink.
+    #[inline]
+    #[must_use]
     pub fn target(&self) -> &'a str {
         let m = self.index.metadata();
         let tgt_idx = m.symlink_table[self.symlink_idx as usize];
@@ -1121,6 +1314,9 @@ impl<'a> From<Device<'a>> for Inode<'a> {
 }
 
 impl Device<'_> {
+    /// Get the device id this special inode represents.
+    #[inline]
+    #[must_use]
     pub fn device_id(&self) -> u64 {
         self.index.metadata().devices.as_ref().expect("validated")[self.device_idx as usize]
     }
@@ -1140,9 +1336,16 @@ impl<'a> From<Ipc<'a>> for Inode<'a> {
 }
 
 /// A regular file inode.
+///
+/// This type implements [`AsChunks`], you can call
+/// [`as_chunks`][AsChunks::as_chunks] or [`read_to_vec`][AsChunks::read_to_vec]
+/// directly on `File` to get its content, without caring about its underlying
+/// representation (shared or unique).
 #[derive(Debug, Clone, Copy)]
 pub enum File<'a> {
+    /// See [`UniqueFile`].
     Unique(UniqueFile<'a>),
+    /// See [`SharedFile`].
     Shared(SharedFile<'a>),
 }
 
@@ -1165,7 +1368,7 @@ impl<'a> AsChunks<'a> for File<'a> {
     }
 }
 
-/// A unique regular file inode.
+/// A file inode whose content is unique in the archive.
 #[derive(Debug, Clone, Copy)]
 pub struct UniqueFile<'a> {
     index: &'a ArchiveIndex,
@@ -1189,68 +1392,18 @@ impl<'a> AsChunks<'a> for UniqueFile<'a> {
         let chunk_end = tbl[self.file_idx as usize + 1];
         ChunkIter {
             index: self.index,
-            chunk_start,
-            chunk_end,
+            start: chunk_start,
+            end: chunk_end,
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ChunkIter<'a> {
-    index: &'a ArchiveIndex,
-    chunk_start: u32,
-    chunk_end: u32,
-}
-
-impl ChunkIter<'_> {
-    /// Iterate over all chunks and return the sum of all chunks' byte length.
-    pub fn total_size(&self) -> u64 {
-        self.clone().map(|c| u64::from(c.size())).sum::<u64>()
-    }
-}
-
-impl sealed::Sealed for ChunkIter<'_> {}
-impl<'a> AsChunks<'a> for ChunkIter<'a> {
-    fn as_chunks(&self) -> ChunkIter<'a> {
-        self.clone()
-    }
-}
-
-impl<'a> Iterator for ChunkIter<'a> {
-    type Item = Chunk<'a>;
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = (self.chunk_end - self.chunk_start) as usize;
-        (len, Some(len))
-    }
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.chunk_start < self.chunk_end {
-            let c = Chunk::new(self.index, self.chunk_start);
-            self.chunk_start += 1;
-            Some(c)
-        } else {
-            None
-        }
-    }
-}
-
-impl DoubleEndedIterator for ChunkIter<'_> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.chunk_start < self.chunk_end {
-            let c = Chunk::new(self.index, self.chunk_end - 1);
-            self.chunk_end -= 1;
-            Some(c)
-        } else {
-            None
-        }
-    }
-}
-
-impl ExactSizeIterator for ChunkIter<'_> {}
-impl FusedIterator for ChunkIter<'_> {}
-
-/// A shared regular file inode.
+/// A file whose content is deduplicated and merged with other files in the
+/// archive.
+///
+/// Note that this is content-based deduplication and has nothing to do with
+/// hard links, which is represented as a single inode referenced by
+/// multiple [`DirEntry`]s.
 #[derive(Debug, Clone, Copy)]
 pub struct SharedFile<'a> {
     index: &'a ArchiveIndex,
@@ -1276,11 +1429,35 @@ impl<'a> AsChunks<'a> for SharedFile<'a> {
         let chunk_end = m.chunk_table[file_idx as usize + 1];
         ChunkIter {
             index: self.index,
-            chunk_start,
-            chunk_end,
+            start: chunk_start,
+            end: chunk_end,
         }
     }
 }
+
+/// Iterator of file content chunks.
+#[derive(Debug, Clone)]
+pub struct ChunkIter<'a> {
+    index: &'a ArchiveIndex,
+    start: u32,
+    end: u32,
+}
+
+impl ChunkIter<'_> {
+    /// Iterate over all chunks and return the sum of all chunks' byte length.
+    pub fn total_size(&self) -> u64 {
+        self.clone().map(|c| u64::from(c.size())).sum::<u64>()
+    }
+}
+
+impl sealed::Sealed for ChunkIter<'_> {}
+impl<'a> AsChunks<'a> for ChunkIter<'a> {
+    fn as_chunks(&self) -> ChunkIter<'a> {
+        self.clone()
+    }
+}
+
+impl_range_iterator!(ChunkIter, Chunk);
 
 /// The description of a chunk of bytes.
 #[derive(Debug, Clone)]
@@ -1301,14 +1478,23 @@ impl<'a> Chunk<'a> {
         }
     }
 
+    /// Get the number (0-based) of section this chunk resides in.
+    #[inline]
+    #[must_use]
     pub fn section_idx(&self) -> u32 {
         self.data.block
     }
 
+    /// Get the start offset of chunk data in the decompressed section payload.
+    #[inline]
+    #[must_use]
     pub fn offset(&self) -> u32 {
         self.data.offset
     }
 
+    /// Get the byte size of this chunk.
+    #[inline]
+    #[must_use]
     pub fn size(&self) -> u32 {
         self.data.size
     }
@@ -1329,8 +1515,8 @@ impl<'a> AsChunks<'a> for Chunk<'a> {
     fn as_chunks(&self) -> ChunkIter<'a> {
         ChunkIter {
             index: self.index,
-            chunk_start: self.chunk_idx,
-            chunk_end: self.chunk_idx + 1,
+            start: self.chunk_idx,
+            end: self.chunk_idx + 1,
         }
     }
 }
@@ -1461,6 +1647,7 @@ impl<R: ReadAt + ?Sized> BufRead for ChunksReader<'_, '_, R> {
         Ok(chunk)
     }
 
+    #[inline]
     fn consume(&mut self, amt: usize) {
         assert!(amt <= self.chunk_rest_size as usize);
         self.in_section_offset += amt as u32;
