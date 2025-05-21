@@ -1,3 +1,56 @@
+//! Library for reading [DwarFS][dwarfs] archives (aka. images).
+//!
+//! [dwarfs]: https://github.com/mhx/dwarfs
+//!
+//! ```
+//! use dwarfs::{Archive, ArchiveIndex, AsChunks};
+//! use std::fs::File;
+//!
+//! # fn wrap() -> dwarfs::Result<()> {
+//! // Open an archive file and load the metadata of it.
+//! let file = File::open("./my.dwarfs")?;
+//! let (index, mut archive) = Archive::new(file)?;
+//!
+//! // Hierarchy traversal.
+//! for entry in index.root().entries() {
+//!     let inode = entry.inode();
+//!     println!("/{} mode={}", entry.name(), inode.metadata().mode());
+//!     if let Some(deep) = inode.as_dir() {
+//!         for entry in deep.entries() {
+//!             // ...
+//!         }
+//!     }
+//! }
+//!
+//! // Resolve paths.
+//! let file: dwarfs::File = index.get_path(["src", "Cargo.toml"])
+//!     .expect("does not exist")
+//!     .as_file()
+//!     .expect("not a file");
+//! // The simple way to read content.
+//! let bytes: Vec<u8> = file.read_to_vec(&mut archive)?;
+//!
+//! # Ok(()) }
+//! ```
+//!
+//! ## Cargo features
+//!
+//! - `zstd`, `lzma`, `lz4` *(Only `zstd` is enabled by default)*
+//!
+//!   Enable relevant decompression algorithm support. `zstd` is the default
+//!   compression algorithm `mkdwarfs` uses and it should be enough for most cases.
+//!
+//! - `log` *(Enabled by default)*
+//!
+//!   Enable trace-level logging and time measurement for internal events via
+//!   [`log` crate][log]. Useful for profiling or debugging. Should not
+//!   have performance penalty unless trace-level log is enabled.
+//!
+//! [log]: https://crates.io/crates/log
+#![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
+#![warn(missing_docs)]
+
 #[cfg(feature = "log")]
 #[macro_use(trace_time)]
 extern crate measure_time;
