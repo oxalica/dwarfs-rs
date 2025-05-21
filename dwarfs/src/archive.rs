@@ -319,7 +319,7 @@ impl ArchiveIndex {
                 .filter_map(|ent| (ent.section_type() == sec_ty).then_some(ent.offset()));
             let off = iter.next().ok_or(ErrorInner::MissingSection(sec_ty))?;
             if iter.next().is_some() {
-                return Err(ErrorInner::DuplicatedSection(sec_ty).into());
+                bail!(ErrorInner::DuplicatedSection(sec_ty));
             }
             Ok(off)
         };
@@ -375,7 +375,7 @@ impl ArchiveIndex {
         // Explicit future-incompatible features.
         if let Some(feat) = &m.features {
             if !feat.is_empty() {
-                return Err(ErrorInner::UnsupportedFeature(format!("{feat:?}")).into());
+                bail!(ErrorInner::UnsupportedFeature(format!("{feat:?}")));
             }
         }
         if m.dir_entries.is_none() {

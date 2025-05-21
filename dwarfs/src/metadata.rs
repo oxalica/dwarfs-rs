@@ -234,18 +234,18 @@ impl Schema {
         const FILE_VERSION: i32 = 1;
 
         if self.file_version != FILE_VERSION {
-            return Err(format!(
+            bail!(format!(
                 "unsupported schema file_version {:?}",
                 self.file_version
             ));
         }
         if self.layouts.get(self.root_layout).is_none() {
-            return Err("missing root_layout".into());
+            bail!("missing root_layout");
         }
 
         for (layout_id, layout) in self.layouts.iter() {
             if layout.fields.is_empty() && layout.bits > 64 {
-                return Err(format!(
+                bail!(format!(
                     "layout {}: primitive type is too large to have {}bits",
                     layout_id, layout.bits,
                 ));
@@ -263,7 +263,7 @@ impl Schema {
                         field.offset.checked_neg()
                     };
                     if field_layout.bits < 0 {
-                        return Err("layout bits cannot be negative");
+                        bail!("layout bits cannot be negative");
                     }
                     let bit_total_size = bit_offset
                         .and_then(|off| (off as u16).checked_add(field_layout.bits as u16));
