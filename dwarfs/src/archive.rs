@@ -142,6 +142,32 @@ pub struct Config {
     metadata_schema_size_limit: usize,
     metadata_size_limit: usize,
     block_cache_size_limit: usize,
+
+    section_index_strategy: SectionIndexStrategy,
+}
+
+/// Whether to trust the section index embedded in the archive?
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SectionIndexStrategy {
+    /// Always use embedded section index.
+    ///
+    /// This guarantees consistent archive loading performance.
+    /// But it is incompatible with archives without section index.
+    UseEmbedded,
+    /// Use embedded section index, or build our own if it does not exist.
+    ///
+    /// The default strategy, balacing between performance and compatibility.
+    #[default]
+    UseEmbeddedIfExists,
+    /// Never use embedded section index but always build our own.
+    ///
+    /// During archive loading, all section headers will be traversed for
+    /// building the index. This is the most defensive strategy which is robust
+    /// on corrupted or fishy index that "happens to be like an index but there
+    /// is actually none". But it significantly slows down archive
+    /// loading due to heavy seeks.
+    Build,
 }
 
 impl Default for Config {
@@ -153,6 +179,7 @@ impl Default for Config {
             metadata_size_limit: 64 << 20,
             // From `dwarfsextract`: 32 x 16MiB (default size) blocks.
             block_cache_size_limit: 512 << 20,
+            section_index_strategy: SectionIndexStrategy::default(),
         }
     }
 }
@@ -217,6 +244,15 @@ impl Config {
     /// larger cache is always preferred.
     pub fn block_cache_size_limit(&mut self, limit: usize) -> &mut Self {
         self.block_cache_size_limit = limit;
+        self
+    }
+
+    /// The strategy to use embedded section index.
+    ///
+    /// The default value is [`SectionIndexStrategy::UseEmbeddedIfExists`].
+    /// See [`SectionIndexStrategy`] for details.
+    pub fn section_index_strategy(&mut self, strategy: SectionIndexStrategy) -> &mut Self {
+        self.section_index_strategy = strategy;
         self
     }
 }
@@ -300,16 +336,33 @@ impl ArchiveIndex {
     ) -> Result<Self> {
         trace_time!("initialize ArchiveIndex");
 
-        // Load section index.
-        let (_, section_index) = rdr
-            .read_section_index(stream_len, config.section_index_size_limit)
-            .context("failed to load section index")?
-            .expect("TODO: will never return missing section index yet");
+        // Load or build the section index.
+        let section_index = (|| {
+            use SectionIndexStrategy as S;
+
+            let strategy = &config.section_index_strategy;
+            if matches!(strategy, S::UseEmbedded | S::UseEmbeddedIfExists) {
+                if let Some((_, index)) = rdr
+                    .read_section_index(stream_len, config.section_index_size_limit)
+                    .context("failed to read section index")?
+                {
+                    return Ok(index);
+                }
+                if *strategy == S::UseEmbedded {
+                    bail!(ErrorInner::MissingSection(SectionType::SECTION_INDEX))
+                }
+            }
+
+            trace_time!("build section index");
+            rdr.build_section_index(stream_len, config.section_index_size_limit)
+                .context("failed to build section index")
+        })()?;
+
+        trace!("archive contains {} sections", section_index.len());
         u32::try_from(section_index.len())
             .ok()
             .context("too many sections")?;
         let section_index = section_index.into_boxed_slice();
-        Self::validate_section_index(&section_index)?;
 
         // Find metadata sections.
         let find_unique_section = |sec_ty: SectionType| -> Result<u64> {
@@ -352,19 +405,6 @@ impl ArchiveIndex {
         };
         this.unpack_validate()?;
         Ok(this)
-    }
-
-    /// Validate the section index.
-    fn validate_section_index(sections: &[SectionIndexEntry]) -> Result<()> {
-        trace_time!("validate section index");
-
-        // TODO: This sorted property seems to be undocumented. Need some clarification.
-        sections
-            .windows(2)
-            .all(|w| w[0].offset() < w[1].offset())
-            .or_context("offsets in section index is not sorted")?;
-
-        Ok(())
     }
 
     /// Guard on filesystem features, unpack packed fields, build decoders and validate index ranges.

@@ -51,12 +51,11 @@ enum ErrorInner {
     },
     PayloadTooLong {
         limit: usize,
-        got: u64,
+        got: Option<u64>,
     },
     Decompress(std::io::Error),
 
     // Other.
-    MalformedSectionIndex(String),
     Io(std::io::Error),
 }
 
@@ -82,17 +81,21 @@ impl fmt::Display for Error {
                     "section type mismatch, expect {expect:?} but got {got:?}"
                 )
             }
-            ErrorInner::PayloadTooLong { limit, got } => {
+            ErrorInner::PayloadTooLong {
+                limit,
+                got: Some(got),
+            } => {
                 write!(
                     f,
                     "section payload has {got} bytes, exceeding the limit of {limit} bytes"
                 )
             }
+            ErrorInner::PayloadTooLong { limit, got: None } => {
+                write!(f, "section payload exceeds the limit of {limit} bytes")
+            }
+
             ErrorInner::Decompress(err) => write!(f, "failed to decompress section payload: {err}"),
 
-            ErrorInner::MalformedSectionIndex(msg) => {
-                write!(f, "malformed section index: {msg}")
-            }
             ErrorInner::Io(err) => err.fmt(f),
         }
     }
@@ -214,7 +217,10 @@ impl Header {
         if let Some(size) = usize::try_from(size).ok().filter(|&n| n <= limit) {
             Ok(size)
         } else {
-            bail!(ErrorInner::PayloadTooLong { limit, got: size })
+            bail!(ErrorInner::PayloadTooLong {
+                limit,
+                got: Some(size)
+            })
         }
     }
 }
@@ -289,6 +295,13 @@ macro_rules! impl_open_enum {
                 $(#[$meta])*
                 pub const $variant: Self = Self($ctor($value));
             )*
+
+            /// Return `true` if this value is known by the library.
+            #[must_use]
+            #[inline]
+            pub fn is_known(self) -> bool {
+                matches!(self, $(Self::$variant)|*)
+            }
         }
     };
 }
@@ -351,6 +364,21 @@ impl fmt::Debug for SectionIndexEntry {
 }
 
 impl SectionIndexEntry {
+    /// Create a section index entry with given section type and offset.
+    ///
+    /// # Errors
+    ///
+    /// If `offset` exceeds 48bits, `None` will be returned.
+    #[must_use]
+    #[inline]
+    pub fn new(typ: SectionType, offset: u64) -> Option<Self> {
+        if offset < 1u64 << 48 {
+            Some(Self((u64::from(typ.0.get()) << 48 | offset).into()))
+        } else {
+            None
+        }
+    }
+
     /// The type of the section this entry is referring to.
     #[must_use]
     #[inline]
@@ -592,24 +620,99 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         }
     }
 
+    /// Construct the section index by traversing all sections.
+    ///
+    /// This will traverse sections one-by-one from `archive_start` to the end
+    /// of stream. All headers will be parsed and validated, but their payloads
+    /// will not.
+    ///
+    /// Note: This may be very costly for large archives or on HDDs because it
+    /// does too many seeks on the disk.
+    ///
+    /// # Errors
+    ///
+    /// Return `Err` if fails to parse or validate section headers (see
+    /// [`SectionReader::read_header_at`]), or if section offset exceeds 48bits,
+    /// which is not representable in section index.
+    pub fn build_section_index(
+        &mut self,
+        stream_len: u64,
+        size_limit: usize,
+    ) -> Result<Vec<SectionIndexEntry>> {
+        let end_offset = stream_len
+            .checked_sub(self.archive_start())
+            .ok_or(ErrorInner::OffsetOverflow)?;
+
+        let mut offset = 0u64;
+        let mut index = Vec::with_capacity(size_limit / size_of::<SectionIndexEntry>());
+        while offset < end_offset {
+            let header = self.read_header_at(offset)?;
+            let ent = SectionIndexEntry::new(header.section_type, offset)
+                .ok_or(ErrorInner::OffsetOverflow)?;
+            if index.len() == index.capacity() {
+                bail!(ErrorInner::PayloadTooLong {
+                    limit: size_limit,
+                    got: None,
+                });
+            }
+            index.push(ent);
+
+            // We just read the header, so the end of header must not overflows.
+            offset = (offset + HEADER_SIZE)
+                .checked_add(header.payload_size.get())
+                .ok_or(ErrorInner::OffsetOverflow)?;
+        }
+        if offset != end_offset {
+            bail!(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "unexpected end of file"
+            ));
+        }
+        Ok(index)
+    }
+
     /// Locate and read the section index, if there is any, with a limited payload size.
     ///
     /// `stream_len` is the total size of the input reader `R`, which is
     /// typically the whole file size.
     ///
-    /// Note: Since there are currently no reliable way to ensure non-existent
-    /// of the section index, this function will return `Err` for DwarFS archive
-    /// without section index. We may change the behavior to return `Ok(None)`
-    /// when there is a reliable way to do it.
+    /// # Detection behaviors
     ///
-    /// See: <https://github.com/mhx/dwarfs/issues/264>
+    /// Since there are currently no reliable way to know if there is a section
+    /// index, the tail could just "looks like an index by chance" or being
+    /// collided to like an index intentionally. Currently we do a best-effort
+    /// detection as follows, but it may change in the future.
+    ///
+    /// 1.  If the header of the first section indicates a DwarFS version
+    ///     without section index support, there must not be an index, and
+    ///     `Ok(None)` is returned.
+    ///
+    /// 2.  Otherwise, read 8 bytes at the end. If it does not look like a valid
+    ///     self-pointing `SectionIndexEntry`, `Ok(None)` is returned.
+    ///
+    /// 3.  If it seems to be valid, follows its offset and read a section
+    ///     header. The header should be like a valid section index capturing
+    ///     the trailing 8 bytes, or `Ok(None)` is returned.
+    ///
+    /// 4.  The content of section index is read. It should have a matched
+    ///     checksum, sorted entries with valid section types. If it all
+    ///     passes, `Ok(Some((header, section_index)))` is returned,
+    ///     otherwise `Ok(None)` is returned.
+    ///
+    ///     This should rule out the possibility that a mocked offset with a
+    ///     mocked section header enclosing multiple real sections inside.
+    ///     Because if there is a valid [`Header`] placed inside section index,
+    ///     the magic-version "DWARFSab" would be interpreted as an invalid
+    ///     section type, causing the index to be rejected.
+    ///
+    /// See more discussion: <https://github.com/mhx/dwarfs/issues/264>
     ///
     /// # Errors
     ///
-    /// The methods is a specialized version of
-    /// [`SectionReader::read_section_at`] and can emit most errors it can emit,
-    /// with the exception of decompression errors: the section index is never
-    /// compressed.
+    /// Returns `Err` for underlying I/O hard-errors.
+    ///
+    /// `Ok(None)` will be returned instead for soft-errors that occur during
+    /// parsing the may-not-exist section index.
     #[allow(
         clippy::missing_panics_doc,
         reason = "allocation failures are allowed to panic at anytime"
@@ -620,73 +723,72 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         payload_size_limit: usize,
     ) -> Result<Option<(Header, Vec<SectionIndexEntry>)>> {
         const INDEX_ENTRY_SIZE64: u64 = size_of::<SectionIndexEntry>() as u64;
+        /// See: <https://github.com/mhx/dwarfs/commit/c103783d4bec8aa658e719c2ed7fe329d1d08676>
+        const SECTION_INDEX_MIN_VERSION: (u8, u8) = (2, 4);
 
-        if stream_len < HEADER_SIZE + INDEX_ENTRY_SIZE64 {
-            // TODO: Should this return `Ok(None)` instead?
-            bail!(ErrorInner::MalformedSectionIndex(format!(
-                "file size {stream_len}B is too small for an index"
-            )));
+        // 1
+        // The first section must be a valid section. Errors can be directly bubbled.
+        let first_magic = self.read_header_at(0)?.magic_version;
+        if (first_magic.major, first_magic.minor) < SECTION_INDEX_MIN_VERSION {
+            return Ok(None);
         }
 
+        // 2
         let mut last_entry = SectionIndexEntry::new_zeroed();
         self.rdr
             .read_exact_at(stream_len - INDEX_ENTRY_SIZE64, last_entry.as_mut_bytes())?;
-        let index_offset = last_entry.offset();
-
         if last_entry.section_type() != SectionType::SECTION_INDEX {
-            bail!(ErrorInner::MalformedSectionIndex(format!(
-                "wrong section type: {:?}",
-                last_entry.section_type(),
-            )));
+            return Ok(None);
         }
-        let Some(payload_size) = (|| {
-            stream_len
-                .checked_sub(self.archive_start)?
-                .checked_sub(index_offset)?
-                .checked_sub(HEADER_SIZE)
-                .filter(|size| *size > 0)
-        })() else {
-            bail!(ErrorInner::MalformedSectionIndex(format!(
-                "invalid offset {index_offset} with no possible space for payload",
-            )));
-        };
-        if payload_size % INDEX_ENTRY_SIZE64 != 0 {
-            bail!(ErrorInner::MalformedSectionIndex(format!(
-                "payload size {payload_size}B is not a multiple of index entries"
-            )));
-        }
-        let header = self.read_header_at(index_offset)?;
 
+        // 3
+        // Note that we already checked that this does not overflow.
+        let index_header_offset = last_entry.offset();
+        let Ok(header) = self.read_header_at(index_header_offset) else {
+            // This could be offset overflow, or magic validation failure.
+            return Ok(None);
+        };
+        let payload_size = header.payload_size.get();
         let num_sections = payload_size / INDEX_ENTRY_SIZE64;
-        if header.section_type != SectionType::SECTION_INDEX
+        // Previous read succeeds, so this cannot overflow.
+        if payload_size != stream_len - index_header_offset - HEADER_SIZE
+            || payload_size % INDEX_ENTRY_SIZE64 != 0
+            || header.section_type != SectionType::SECTION_INDEX
             || header.compress_algo != CompressAlgo::NONE
-            || header.payload_size != payload_size
             || u64::from(header.section_number.get()) != num_sections - 1
         {
-            bail!(ErrorInner::MalformedSectionIndex(format!(
-                "invalid section index header: expect correct type, no compression, \
-                payload size {}B, section number {}, got: {:?}",
-                payload_size,
-                num_sections - 1,
-                header,
-            )));
+            return Ok(None);
         }
 
-        // Header is valid. Now read the index.
+        // 4
         if payload_size > payload_size_limit as u64 {
             bail!(ErrorInner::PayloadTooLong {
-                got: payload_size,
+                got: Some(payload_size),
                 limit: payload_size_limit
             });
         }
-        // The payload size does not overflow `usize`, so it / 8 must also does not.
-        let mut buf =
+        // The payload size does not overflow `usize` because of previous `if`,
+        // so it / 8 must do not either.
+        let mut entries =
             SectionIndexEntry::new_vec_zeroed(num_sections as usize).expect("alloc failed");
-        let buf_bytes = buf.as_mut_bytes();
+        let buf_bytes = entries.as_mut_bytes();
         debug_assert_eq!(buf_bytes.len() as u64, payload_size);
+        // We checked the size captures the whole tail without overflow.
         self.rdr
-            .read_exact_at(index_offset + HEADER_SIZE, buf_bytes)?;
-        header.validate_fast_checksum(buf_bytes)?;
-        Ok(Some((header, buf)))
+            .read_exact_at(index_header_offset + HEADER_SIZE, buf_bytes)?;
+
+        // Final validation for content.
+        if header.validate_fast_checksum(buf_bytes).is_err() {
+            return Ok(None);
+        }
+        let mut prev = 0u64;
+        for ent in &entries {
+            if !ent.section_type().is_known() || prev >= ent.offset() {
+                return Ok(None);
+            }
+            prev = ent.offset();
+        }
+
+        Ok(Some((header, entries)))
     }
 }
