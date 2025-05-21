@@ -42,6 +42,14 @@ fn serde_schema() {
 
 #[test]
 fn de_frozen() {
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    struct Pair {
+        a: u32,
+        #[serde(default)]
+        b: u32,
+        c: u32,
+    }
+
     let schema = Schema {
         relax_type_checks: true,
         layouts: DenseMap(vec![
@@ -73,14 +81,6 @@ fn de_frozen() {
         root_layout: 1,
         file_version: 1,
     };
-
-    #[derive(Debug, PartialEq, Eq, Deserialize)]
-    struct Pair {
-        a: u32,
-        #[serde(default)]
-        b: u32,
-        c: u32,
-    }
 
     let de = super::serde_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
     assert_eq!(

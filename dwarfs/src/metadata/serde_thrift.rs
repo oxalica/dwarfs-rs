@@ -226,7 +226,7 @@ impl<'de> de::MapAccess<'de> for StructDeserializer<'_, 'de> {
         self.value_type = Tag::try_from(b & 0xF)?;
 
         // Map range 1.. to 0.. for serde.
-        let field_id = (self.field_id - 1) as i64 as u64;
+        let field_id = (self.field_id - 1) as u64;
         seed.deserialize(de::value::U64Deserializer::new(field_id))
             .map(Some)
     }
@@ -494,7 +494,7 @@ impl<'w> ser::Serializer for ValueSerializer<'w> {
 
 pub(crate) struct StructSerializer<'w> {
     w: &'w mut Vec<u8>,
-    /// 0bxxxx0000 where xxxx is the field_id delta from the previous field.
+    /// 0bxxxx0000 where xxxx is the `field_id` delta from the previous field.
     field_id_diff_tag: u8,
 }
 

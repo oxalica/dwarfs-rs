@@ -53,7 +53,7 @@ struct Source<'a> {
     bytes: &'a [u8],
 }
 
-impl<'a> Source<'a> {
+impl Source<'_> {
     /// Load 1 bits at `base_bit`, using little-endian.
     ///
     /// This assumes the input is in bound. Validation should be done on structs.
@@ -345,7 +345,7 @@ struct SeqDeserializer<'a, 'de> {
     len: u32,
 }
 
-impl<'a, 'de> de::SeqAccess<'de> for SeqDeserializer<'a, 'de> {
+impl<'de> de::SeqAccess<'de> for SeqDeserializer<'_, 'de> {
     type Error = Error;
 
     fn size_hint(&self) -> Option<usize> {

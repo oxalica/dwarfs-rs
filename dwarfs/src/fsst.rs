@@ -41,8 +41,14 @@ impl Decoder {
     /// - Trailing bytes are allowed but ignored.
     ///
     /// License of libfstt: MIT License, Copyright 2018-2020, CWI, TU Munich, FSU Jena
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` if the input cannot be successfully parsed.
+    #[allow(clippy::missing_panics_doc, reason = "never panics")]
+    #[must_use]
     pub fn parse_symtab(symtab: &[u8]) -> Option<Self> {
-        const VERSION: u32 = 20190218;
+        const VERSION: u32 = 2019_0218;
         const SYM_CORRUPT: u64 = u64::from_ne_bytes(*b"corrupt\0");
 
         let mut symbols = [0u64; 255];
@@ -53,7 +59,8 @@ impl Decoder {
         // using the fact the most-significant byte is always zero while the
         // least-significant byte is always non-zero.
         // Need further discussion with upstream.
-        let mut version_field = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let mut version_field = u64::from_le_bytes(header[..8].try_into().expect("length matches"));
+        #[allow(clippy::verbose_bit_mask, reason = "less clear")]
         if version_field & 0xFF == 0 {
             version_field = version_field.to_be();
         }
@@ -63,7 +70,7 @@ impl Decoder {
         let zero_terminated = header[8] & 1 != 0;
         (!zero_terminated).then_some(())?;
 
-        let len_histo = <[u8; 8]>::try_from(&header[9..17]).unwrap();
+        let len_histo = <[u8; 8]>::try_from(&header[9..17]).expect("length matches");
 
         let mut code = 0;
         let mut pos = 0;
@@ -85,6 +92,8 @@ impl Decoder {
     }
 
     /// Return the max possible decoded length of `input_len` length input.
+    #[inline]
+    #[must_use]
     pub fn max_decode_len(input_len: usize) -> usize {
         // `usize::MAX` on overflow will guarantee a OOM on allocation.
         input_len.checked_mul(8).unwrap_or(usize::MAX)
@@ -122,7 +131,10 @@ impl Decoder {
 
     /// Decode `input` into an owned byte string.
     ///
+    /// # Errors
+    ///
     /// If an error occurs during decoding, `None` is returned.
+    #[must_use]
     pub fn decode(&self, input: &[u8]) -> Option<BString> {
         let mut buf = vec![0u8; Self::max_decode_len(input.len())];
         let len = self.decode_into(input, &mut buf)?;

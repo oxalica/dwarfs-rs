@@ -133,7 +133,7 @@ impl<T> DenseMap<T> {
 /// The Frozen schema. You should treat this type as opaque.
 ///
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct Schema {
@@ -150,7 +150,7 @@ pub struct Schema {
 /// You should treat this type as opaque.
 ///
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaLayout {
@@ -170,7 +170,7 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 /// You should treat this type as opaque.
 ///
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaField {
@@ -190,10 +190,15 @@ impl SchemaField {
 impl Schema {
     /// Parse the schema from the on-disk serialized from
     /// ([`SectionType::METADATA_V2_SCHEMA`](crate::section::SectionType::METADATA_V2_SCHEMA)),
-    /// and validate basic invariants.
     ///
     /// The schema type and parser are specialized for [`Metadata::parse`]. It
     /// should not be used for Frozen schema of other data structures.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if fails to parse the input, or the parsed result fails
+    /// basic invariant validations. Currently only index ranges are checked,
+    /// the validated invariants may change in the future.
     pub fn parse(input: &[u8]) -> Result<Self> {
         let this = serde_thrift::deserialize_struct::<Self>(input)
             .map_err(|err| Error(format!("failed to parse schema: {err}").into()))?;
@@ -210,6 +215,11 @@ impl Schema {
     ///
     /// - If `schema1 == schema2`, then `schema1.to_bytes()? == schema2.to_bytes()?`
     /// - `Schema::parse(schema.to_bytes()?)? == schema`
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if serialization fails. Currently this can happen on
+    /// overly large collections whose length exceeds `i32::MAX`.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         serde_thrift::serialize_struct(self)
             .map_err(|err| Error(format!("failed to serialize schema: {err}").into()))
@@ -281,11 +291,15 @@ impl<T: fmt::Debug> fmt::Debug for OrderedSet<T> {
 
 impl<T> OrderedSet<T> {
     /// Returns the number of elements in the underlying `Vec`.
+    #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns true if the underlying `Vec` contains no elements.
+    #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -295,6 +309,7 @@ impl<T> OrderedSet<T> {
     /// This uses binary search and the underlying `Vec` must be sorted by
     /// ascending `T`, otherwise, it will return an unspecified result but will
     /// not panic.
+    #[must_use]
     pub fn contains<Q>(&self, value: &Q) -> bool
     where
         T: Borrow<Q> + Ord,
@@ -359,11 +374,15 @@ impl<K: Serialize, V: Serialize> Serialize for OrderedMap<K, V> {
 
 impl<K, V> OrderedMap<K, V> {
     /// Returns the number of elements in the underlying `Vec`.
+    #[must_use]
+    #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
     /// Returns true if the underlying `Vec` contains no elements.
+    #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -373,6 +392,7 @@ impl<K, V> OrderedMap<K, V> {
     /// This uses binary search and the underlying `Vec` must be sorted by
     /// ascending `K`, otherwise, it will return an unspecified result but will
     /// not panic.
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q> + Ord,
@@ -390,6 +410,15 @@ impl Metadata {
     /// Parse the metadata from on-disk serialized form
     /// ([`SectionType::METADATA_V2`](crate::section::SectionType::METADATA_V2)),
     /// using layout defined by the given schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if fails to deserialize. This can happen on invalid input
+    /// bytes, invalid `schema`, length overflows and etc.
+    ///
+    /// Since only structures but not values are checked, this method may
+    /// optmisticly accept some "semantically invalid" `Metadata`.
+    /// The tolorence on invalid parts may change in the future.
     pub fn parse(schema: &Schema, bytes: &[u8]) -> Result<Self> {
         serde_frozen::deserialize(schema, bytes)
             .map_err(|err| Error(format!("failed to parse metadata: {err}").into()))
@@ -397,7 +426,7 @@ impl Metadata {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -448,7 +477,7 @@ pub struct Metadata {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -460,7 +489,7 @@ pub struct Chunk {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -472,7 +501,7 @@ pub struct Directory {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -491,7 +520,7 @@ pub struct InodeData {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -502,7 +531,8 @@ pub struct DirEntry {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
+#[expect(clippy::struct_excessive_bools, reason = "follows upstream")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -516,7 +546,7 @@ pub struct FsOptions {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -529,7 +559,7 @@ pub struct StringTable {
 }
 
 /// See [module level documentation][self] for details.
-#[allow(missing_docs, reason = "users should check upstream docs")]
+#[expect(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]

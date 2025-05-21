@@ -90,11 +90,12 @@ pub mod section;
 
 pub use positioned_io;
 
-/// The (included) minimum (major, minor) version this library supports.
-pub const DWARFS_VERSION_MIN: (u8, u8) = (2, 5);
+/// The inclusive minimum version tuple this library supports.
+// TODO: We could lower this.
+pub const SUPPORTED_VERSION_MIN: (u8, u8) = (2, 5);
 
-/// The (included) maximum (major, minor) version this library supports.
-pub const DWARFS_VERSION_MAX: (u8, u8) = (2, 5);
+/// The inclusive maximum version tuple this library supports.
+pub const SUPPORTED_VERSION_MAX: (u8, u8) = (2, 5);
 
 use std::{cmp::Ordering, ops::Range};
 

@@ -20,6 +20,8 @@ use positioned_io::ReadAt;
 use xxhash_rust::xxh3::Xxh3Default;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as le};
 
+use crate::{SUPPORTED_VERSION_MAX, SUPPORTED_VERSION_MIN};
+
 type Result<T> = std::result::Result<T, Error>;
 
 /// An error raised from reading, validating, or decompressiong sections.
@@ -157,6 +159,11 @@ impl fmt::Debug for Header {
 
 impl Header {
     /// Validate section checksum of header and payload using the "fast" XXH3-64 hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the length of `payload` disagree with the header, or the
+    /// checksum mismatches.
     pub fn validate_fast_checksum(&self, payload: &[u8]) -> Result<()> {
         if payload.len() as u64 != self.payload_size.get() {
             bail!(ErrorInner::LengthMismatch);
@@ -171,6 +178,11 @@ impl Header {
     }
 
     /// Validate section checksum of header and payload using the "slow" SHA2-512/256 hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the length of `payload` disagree with the header, or the
+    /// checksum mismatches.
     pub fn validate_slow_checksum(&self, payload: &[u8]) -> Result<()> {
         use sha2::Digest;
 
@@ -211,7 +223,7 @@ impl Header {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct MagicVersion {
-    /// The section magic that should match [MagicVersion::MAGIC].
+    /// The section magic that should match `DWARFS` ([`MagicVersion::MAGIC`]).
     pub magic: [u8; 6],
     /// The format major version.
     pub major: u8,
@@ -233,13 +245,19 @@ impl MagicVersion {
     /// The expected magic.
     pub const MAGIC: [u8; 6] = *b"DWARFS";
 
-    /// Validate if the magic matches and the format version is supported by this library.
+    /// Validate if the magic and version is supported by this library.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the magic does not match [`MAGIC`](Self::MAGIC), or the
+    /// specified DwarFS version is outside the supported range
+    /// [`SUPPORTED_VERSION_MIN`]..=[`SUPPORTED_VERSION_MAX`].
     pub fn validate(self) -> Result<()> {
         let ver = (self.major, self.minor);
         if self.magic != Self::MAGIC {
             bail!(ErrorInner::InvalidMagic(self.magic));
         }
-        if crate::DWARFS_VERSION_MIN <= ver && ver <= crate::DWARFS_VERSION_MAX {
+        if SUPPORTED_VERSION_MIN <= ver && ver <= SUPPORTED_VERSION_MAX {
             Ok(())
         } else {
             bail!(ErrorInner::UnsupportedVersion(ver.0, ver.1))
@@ -336,8 +354,9 @@ impl SectionIndexEntry {
     /// The type of the section this entry is referring to.
     #[must_use]
     #[inline]
+    #[allow(clippy::missing_panics_doc, reason = "never panics")]
     pub fn section_type(self) -> SectionType {
-        SectionType((self.0 >> 48).try_into().expect("must not overflow u16"))
+        SectionType((self.0 >> 48).try_into().expect("always in u16 range"))
     }
 
     /// The offset of the section this entry is referring to,
@@ -444,7 +463,12 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
 
     /// Read and decompress a full section at `offset` into memory.
     ///
-    /// This is a combination of [`Self::read_header_at`] and [`Self::read_payload_at`].
+    /// This is a shortcut to call [`read_header_at`][Self::read_header_at] and
+    /// [`read_payload_at`][Self::read_payload_at].
+    ///
+    /// # Errors
+    ///
+    /// See `read_header_at` and `read_payload_at`.
     pub fn read_section_at(
         &mut self,
         section_offset: u64,
@@ -458,6 +482,11 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
     }
 
     /// Read a section header at `section_offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if section offset overflows, the underlying read operation
+    /// fails, header magic is invalid or header DwarFS version is unsupported.
     pub fn read_header_at(&mut self, section_offset: u64) -> Result<Header> {
         let file_offset = self
             .archive_start
@@ -472,8 +501,12 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
 
     /// Read and decompress section payload of given header into a owned `Vec<u8>`.
     ///
-    /// Same as [`Self::read_payload_at_into`] but return an `Vec<u8>` for
-    /// convenience.
+    /// Same as [`read_payload_at_into`][Self::read_payload_at_into] but returns
+    /// an `Vec<u8>` for convenience.
+    ///
+    /// # Errors
+    ///
+    /// See `read_payload_at_into`.
     pub fn read_payload_at(
         &mut self,
         header: &Header,
@@ -491,6 +524,15 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
     /// `payload_offset` is the offset of the body of a section (after the header),
     /// from the start of archive. Both compressed and decompressed size must
     /// be within the `out.len()`, or an error will be emitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if either:
+    /// - Payload offset overflows
+    /// - Payload size exceeds the limit.
+    /// - The underlying read operation fails.
+    /// - Fast checksum (XXH3-64) of payload disagrees with the header.
+    /// - Decompression fails. This includes decompressed size exceeding the limit.
     pub fn read_payload_at_into(
         &mut self,
         header: &Header,
@@ -521,6 +563,10 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 Ok(len)
             }
             #[cfg(feature = "lzma")]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "will not overflow usize because all data is in memory"
+            )]
             CompressAlgo::LZMA => (|| {
                 let mut stream = xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
                 let st = stream.process(raw_buf, out, xz2::stream::Action::Run)?;
@@ -557,6 +603,17 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
     /// when there is a reliable way to do it.
     ///
     /// See: <https://github.com/mhx/dwarfs/issues/264>
+    ///
+    /// # Errors
+    ///
+    /// The methods is a specialized version of
+    /// [`SectionReader::read_section_at`] and can emit most errors it can emit,
+    /// with the exception of decompression errors: the section index is never
+    /// compressed.
+    #[allow(
+        clippy::missing_panics_doc,
+        reason = "allocation failures are allowed to panic at anytime"
+    )]
     pub fn read_section_index(
         &mut self,
         stream_len: u64,
