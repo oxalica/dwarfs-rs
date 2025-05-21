@@ -369,7 +369,7 @@ impl ArchiveIndex {
                     })
                     // Use inode count as a loose upper bound, to guard from length exploding.
                     .filter(|&n| n < m.inodes.len() as u32)
-                    .context("loosy this")?;
+                    .context("length overflow for packed shared files")?;
                 let mut unpacked = Vec::with_capacity(unpacked_len as usize);
                 unpacked.extend(
                     std::iter::zip(shared, 2usize..)
@@ -1335,7 +1335,7 @@ impl<'a> AsChunks<'a> for Chunk<'a> {
     }
 }
 
-/// Trait for data-bearing objects, notibly [`File`]s and [`Chunk`]s.
+/// Trait for data-bearing objects, notably [`File`]s and [`Chunk`]s.
 ///
 /// In dwarfs, regular files consist of multiple chunks of data concatenated for
 /// deduplication. You can iterate over these chunks and locate section index

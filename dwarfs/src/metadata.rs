@@ -1,4 +1,21 @@
-//! See: <https://github.com/mhx/dwarfs/blob/v0.12.3/thrift/metadata.thrift>
+//! The low-level metadata structures and parsers.
+//!
+//! The parsed [`Metadata`] and [`Schema`] is given as-is from the underlying
+//! structure without additional modification. Notably, for `Metadata`, no
+//! unpacking is performed, no value validation is performed, and only binary
+//! syntax and structure are validated.
+//!
+//! For high-level access of the image hierarchy and content, use
+//! [`Archive`][crate::Archive] instead.
+//!
+//! See upstream documentations for the meaning of structs and fields:
+//!
+//! - Metadata definition: <https://github.com/mhx/dwarfs/blob/v0.12.4/thrift/metadata.thrift>
+//!
+//! - Frozen schema definition: <https://github.com/facebook/fbthrift/blob/2f5415eed3a4981b5b1535a504a76b9309834a90/thrift/lib/thrift/frozen.thrift>
+//!   
+//!   Typically, users should treat [`Schema`] as an opaque type, because the
+//!   definition in this crate is specialized only for [`Metadata::parse`].
 use std::{borrow::Borrow, fmt, marker::PhantomData, ops};
 
 use bstr::BString;
@@ -12,6 +29,7 @@ mod tests;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An error raised from parsing schema or metadata.
 #[derive(Debug)]
 pub struct Error(Box<str>);
 
@@ -96,7 +114,7 @@ impl<T> ops::Index<i16> for DenseMap<T> {
 }
 
 impl<T> DenseMap<T> {
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
@@ -112,6 +130,10 @@ impl<T> DenseMap<T> {
     }
 }
 
+/// The Frozen schema. You should treat this type as opaque.
+///
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct Schema {
@@ -125,6 +147,10 @@ pub struct Schema {
     pub file_version: i32,
 }
 
+/// You should treat this type as opaque.
+///
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaLayout {
@@ -141,6 +167,10 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
     *v == T::default()
 }
 
+/// You should treat this type as opaque.
+///
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaField {
@@ -158,6 +188,12 @@ impl SchemaField {
 }
 
 impl Schema {
+    /// Parse the schema from the on-disk serialized from
+    /// ([`SectionType::METADATA_V2_SCHEMA`](crate::section::SectionType::METADATA_V2_SCHEMA)),
+    /// and validate basic invariants.
+    ///
+    /// The schema type and parser are specialized for [`Metadata::parse`]. It
+    /// should not be used for Frozen schema of other data structures.
     pub fn parse(input: &[u8]) -> Result<Self> {
         let this = serde_thrift::deserialize_struct::<Self>(input)
             .map_err(|err| Error(format!("failed to parse schema: {err}").into()))?;
@@ -165,6 +201,15 @@ impl Schema {
         Ok(this)
     }
 
+    /// Serialize the schema to on-disk bytes, does the reverse of [`Schema::parse`].
+    ///
+    /// Note that the serialization format is not canonical, so
+    /// `Schema::parse(bytes)?.to_bytes() == bytes` may NOT hold.
+    /// However, this function alone is reproducible and the result is
+    /// revertible, that means:
+    ///
+    /// - If `schema1 == schema2`, then `schema1.to_bytes()? == schema2.to_bytes()?`
+    /// - `Schema::parse(schema.to_bytes()?)? == schema`
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         serde_thrift::serialize_struct(self)
             .map_err(|err| Error(format!("failed to serialize schema: {err}").into()))
@@ -235,14 +280,21 @@ impl<T: fmt::Debug> fmt::Debug for OrderedSet<T> {
 }
 
 impl<T> OrderedSet<T> {
+    /// Returns the number of elements in the underlying `Vec`.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns true if the underlying `Vec` contains no elements.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Return true if the underlying `Vec` contains `value`.
+    ///
+    /// This uses binary search and the underlying `Vec` must be sorted by
+    /// ascending `T`, otherwise, it will return an unspecified result but will
+    /// not panic.
     pub fn contains<Q>(&self, value: &Q) -> bool
     where
         T: Borrow<Q> + Ord,
@@ -306,14 +358,21 @@ impl<K: Serialize, V: Serialize> Serialize for OrderedMap<K, V> {
 }
 
 impl<K, V> OrderedMap<K, V> {
+    /// Returns the number of elements in the underlying `Vec`.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns true if the underlying `Vec` contains no elements.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Search and get the `value` corresponding to `key` in the map.
+    ///
+    /// This uses binary search and the underlying `Vec` must be sorted by
+    /// ascending `K`, otherwise, it will return an unspecified result but will
+    /// not panic.
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q> + Ord,
@@ -328,13 +387,17 @@ impl<K, V> OrderedMap<K, V> {
 }
 
 impl Metadata {
-    /// Parse the metadata from on-disk serialized form, using the given schema.
+    /// Parse the metadata from on-disk serialized form
+    /// ([`SectionType::METADATA_V2`](crate::section::SectionType::METADATA_V2)),
+    /// using layout defined by the given schema.
     pub fn parse(schema: &Schema, bytes: &[u8]) -> Result<Self> {
         serde_frozen::deserialize(schema, bytes)
             .map_err(|err| Error(format!("failed to parse metadata: {err}").into()))
     }
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -384,6 +447,8 @@ pub struct Metadata {
     // pub reg_file_size_cache: Option<InodeSizeCache>,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -394,6 +459,8 @@ pub struct Chunk {
     pub size: u32,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -404,6 +471,8 @@ pub struct Directory {
     pub self_entry: u32,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -421,6 +490,8 @@ pub struct InodeData {
     pub ctime_offset: u32,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -430,6 +501,8 @@ pub struct DirEntry {
     pub inode_num: u32,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -442,6 +515,8 @@ pub struct FsOptions {
     pub packed_shared_files_table: bool,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]
@@ -453,6 +528,8 @@ pub struct StringTable {
     pub packed_index: bool,
 }
 
+/// See [module level documentation][self] for details.
+#[allow(missing_docs, reason = "users should check upstream docs")]
 #[derive(Default, Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[non_exhaustive]
 #[serde(default)]

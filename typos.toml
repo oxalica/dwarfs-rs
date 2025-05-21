@@ -1,0 +1,3 @@
+[default.extend-words]
+# A workaround for keyword "type".
+typ = "typ"

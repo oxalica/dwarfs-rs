@@ -17,7 +17,7 @@ fn serde_schema() {
 
     let expect = [
         // struct
-        0x11, // field `relax_tyep_checks` (id = 1), value = true
+        0x11, // field `relax_type_checks` (id = 1), value = true
         0x1b, // field `layouts` (id = 0 + 1 = 1), type = 0xb map
         0x01, //   map size = 1
         0x4c, //   key = i16, value = struct
