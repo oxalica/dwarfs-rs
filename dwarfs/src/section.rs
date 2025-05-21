@@ -1,6 +1,6 @@
-//! The low-level module for accessing sections in a DwarFS image.
+//! The low-level module for accessing sections in a DwarFS archive.
 //!
-//! A DwarFS image consists of several sections. Sections for storing raw file
+//! A DwarFS archive consists of several sections. Sections for storing raw file
 //! data are also called blocks. Each section consists of a [`Header`] and
 //! maybe-compressed section payload bytes. The maximum uncompressed payload
 //! length of each data section is the block-size, which is by default 16MiB.
@@ -131,7 +131,7 @@ pub struct Header {
     pub slow_hash: [u8; 32],
     /// The "fast" hash digests of XXH3-64.
     pub fast_hash: [u8; 8],
-    /// The 0-based index of this section in the DwarFS image.
+    /// The 0-based index of this section in the DwarFS archive.
     pub section_number: le::U32,
     /// The type of this section.
     pub section_type: SectionType,
@@ -360,9 +360,9 @@ impl SectionIndexEntry {
 /// sequential read inside a several MiB section.
 /// On Windows, however, `RandomAccessFile` is several times faster than `File`.
 pub struct SectionReader<R: ?Sized> {
-    /// The offset of the start of the dwarfs image, which is added to all
+    /// The offset of the start of the DwarFS archive in `rdr`, which is added to all
     /// operation offsets.
-    image_offset: u64,
+    archive_start: u64,
     /// The temporary buffer for raw compressed section payload.
     /// It is stored only for allocation reuse. This struct is still state-less.
     raw_buf: Vec<u8>,
@@ -372,7 +372,7 @@ pub struct SectionReader<R: ?Sized> {
 impl<R: fmt::Debug + ?Sized> fmt::Debug for SectionReader<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SectionReader")
-            .field("image_offset", &self.image_offset)
+            .field("archive_start", &self.archive_start)
             .field(
                 "raw_buf",
                 &format_args!("{}/{}", self.raw_buf.len(), self.raw_buf.capacity()),
@@ -393,14 +393,15 @@ impl<R> SectionReader<R> {
         Self::new_with_offset(rdr, 0)
     }
 
-    /// Same as [`Self::new`] but indicates the dwarfs image is at
-    /// `image_offset` in `rdr`.
+    /// Same as [`Self::new`] but indicates the DwarFS archive is located at
+    /// `archive_start` in `rdr` instead of the start. This is also known as
+    /// `image_offset`.
     ///
-    /// All read methods of [`SectionReader`] will add `image_offset` to its
+    /// All read methods of [`SectionReader`] will add `archive_start` to its
     /// parameter for the real file offset if necessary.
-    pub fn new_with_offset(rdr: R, image_offset: u64) -> Self {
+    pub fn new_with_offset(rdr: R, archive_start: u64) -> Self {
         SectionReader {
-            image_offset,
+            archive_start,
             raw_buf: Vec::new(),
             rdr,
         }
@@ -434,11 +435,11 @@ impl<R: ?Sized> SectionReader<R> {
 }
 
 impl<R: ReadAt + ?Sized> SectionReader<R> {
-    /// Get the `image_offset` set on creation.
+    /// Get the `archive_start` set on creation.
     #[inline]
     #[must_use]
-    pub fn image_offset(&self) -> u64 {
-        self.image_offset
+    pub fn archive_start(&self) -> u64 {
+        self.archive_start
     }
 
     /// Read and decompress a full section at `offset` into memory.
@@ -459,7 +460,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
     /// Read a section header at `section_offset`.
     pub fn read_header_at(&mut self, section_offset: u64) -> Result<Header> {
         let file_offset = self
-            .image_offset
+            .archive_start
             .checked_add(section_offset)
             .ok_or(ErrorInner::OffsetOverflow)?;
         let mut header = Header::new_zeroed();
@@ -497,7 +498,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         out: &mut [u8],
     ) -> Result<usize> {
         let file_offset = self
-            .image_offset
+            .archive_start
             .checked_add(payload_offset)
             .ok_or(ErrorInner::OffsetOverflow)?;
 
@@ -551,7 +552,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
     /// typically the whole file size.
     ///
     /// Note: Since there are currently no reliable way to ensure non-existent
-    /// of the section index, this function will return `Err` for dwarfs image
+    /// of the section index, this function will return `Err` for DwarFS archive
     /// without section index. We may change the behavior to return `Ok(None)`
     /// when there is a reliable way to do it.
     ///
@@ -583,7 +584,7 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         }
         let Some(payload_size) = (|| {
             stream_len
-                .checked_sub(self.image_offset)?
+                .checked_sub(self.archive_start)?
                 .checked_sub(index_offset)?
                 .checked_sub(HEADER_SIZE)
                 .filter(|size| *size > 0)

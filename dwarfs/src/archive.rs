@@ -1,4 +1,4 @@
-//! The high-level interface for accessing a dwarfs archive.
+//! The high-level interface for accessing a DwarFS archive.
 
 use std::{
     fmt,
@@ -683,7 +683,7 @@ pub struct Archive<R: ?Sized> {
 }
 
 impl<R: ReadAt + Size> Archive<R> {
-    /// Load a dwarfs archive (aka. dwarfs image) from a [`Seek`]-able stream,
+    /// Load a DwarFS archive from a [`Seek`]-able stream,
     /// typically a [`std::fs::File`].
     ///
     /// Note 1: Do not use [`BufReader`][std::io::BufReader], because
@@ -990,7 +990,7 @@ impl<'a> Dir<'a> {
 
     /// Find the entry of given name in this directory.
     ///
-    /// In dwarfs, directory entries are listed in ascending order of names.
+    /// In DwarFS, directory entries are listed in ascending order of names.
     /// So `get` performs a binary search and the time complexity is
     /// `O(min(L, L0) log N)` where `L` is the max length of entry names, `L0`
     /// is the `name.len()` and `N` is the number of entries in this directory.
@@ -1337,7 +1337,7 @@ impl<'a> AsChunks<'a> for Chunk<'a> {
 
 /// Trait for data-bearing objects, notably [`File`]s and [`Chunk`]s.
 ///
-/// In dwarfs, regular files consist of multiple chunks of data concatenated for
+/// In DwarFS, regular files consist of multiple chunks of data concatenated for
 /// deduplication. You can iterate over these chunks and locate section index
 /// and offsets in order to retrieve the actual bytes.
 ///
@@ -1355,7 +1355,7 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
     /// this object consists of.
     ///
     /// The user must guarantee the owning [`ArchiveIndex`] of `self` and
-    /// `archive` must come from the same dwarfs archive, or the behavior is
+    /// `archive` must come from the same DwarFS archive, or the behavior is
     /// unspecified: it may return garbage data, panic, or fail.
     fn as_reader<'b, R: ?Sized>(&self, archive: &'b mut Archive<R>) -> ChunksReader<'a, 'b, R> {
         ChunksReader {
@@ -1419,7 +1419,7 @@ pub struct ChunksReader<'a, 'b, R: ?Sized> {
 impl<R: ?Sized> ChunksReader<'_, '_, R> {
     /// Iterate over all chunks and return the sum of all chunks' byte length.
     ///
-    /// This number is exact, unless the dwarfs archive is changed during access
+    /// This number is exact, unless the DwarFS archive is changed during access
     /// or some underlying I/O failure occurs.
     pub fn total_size(&self) -> u64 {
         self.chunks.total_size() + u64::from(self.chunk_rest_size)

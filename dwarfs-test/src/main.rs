@@ -18,25 +18,25 @@ mod mtree;
 enum Cli {
     /// Deserialize, serialize, re-deserialize the schema to verify it's the same result.
     SchemaRoundtrip {
-        /// The input dwarfs archive path.
+        /// The input DwarFS archive path.
         input: String,
     },
-    /// Dump the hierarchy and metadata of a dwarfs archive in "mtree" text format.
+    /// Dump the hierarchy and metadata of a DwarFS archive in "mtree" text format.
     Mtree {
         /// The output file to write. If omitted, stdout is implied.
         #[arg(long, short)]
         output: Option<String>,
-        /// The input dwarfs archive path.
+        /// The input DwarFS archive path.
         input: String,
         /// Only check equality of the "mtree" output against `dwarfsextract`
         /// output, without printing or writing it.
         #[arg(long, conflicts_with = "output")]
         check: bool,
     },
-    /// Read file contents of a dwarfs archive, and optionally compare them
+    /// Read file contents of a DwarFS archive, and optionally compare them
     /// against `dwarfsextract`.
     Read {
-        /// The input dwarfs archive path.
+        /// The input DwarFS archive path.
         input: String,
         /// Check equality of contents between the results of `dwarfextract`.
         /// If unset, contents are only read and dropped, useful for benchmarks.

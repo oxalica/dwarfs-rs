@@ -408,7 +408,7 @@ pub struct Metadata {
     pub directories: Vec<Directory>,
     pub inodes: Vec<InodeData>,
     pub chunk_table: Vec<u32>,
-    #[deprecated = "deprecated since dwarfs 2.3"]
+    #[deprecated = "deprecated since DwarFS 2.3"]
     pub entry_table: Vec<u32>,
     pub symlink_table: Vec<u32>,
     pub uids: Vec<u32>,
@@ -478,10 +478,10 @@ pub struct Directory {
 #[serde(default)]
 pub struct InodeData {
     // NB. Field order matters for ser/de impl.
-    #[deprecated = "deprecated since dwarfs 2.3"]
+    #[deprecated = "deprecated since DwarFS 2.3"]
     pub name_index: u32,
     pub mode_index: u32,
-    #[deprecated = "deprecated since dwarfs 2.3"]
+    #[deprecated = "deprecated since DwarFS 2.3"]
     pub inode: u32,
     pub owner_index: u32,
     pub group_index: u32,

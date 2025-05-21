@@ -12,7 +12,7 @@
 //!   and examples:
 //!   <https://github.com/mhx/dwarfs/blob/63b0cc70d04a95f366399d60be66b34791762058/doc/dwarfs-format.md>
 //!   
-//! - Me (oxalica) reverse engineering bytes layouts in dwarfs metadata block, and
+//! - Me (oxalica) reverse engineering bytes layouts in DwarFS metadata block, and
 //!   comparing with the metadata dump from:
 //!   `dwarfsck $imgfile -d metadata_full_dump`
 

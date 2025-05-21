@@ -47,7 +47,7 @@ pub fn traverse_dir(
 
     let mut ret = CheckResult { files: 0, oks: 0 };
     for (_, path, f) in &files {
-        let data = f.read_to_vec(archive).expect("failed to read dwarfs file");
+        let data = f.read_to_vec(archive).expect("failed to read DwarFS file");
         ret.files += 1;
         if do_check {
             let expect = std::fs::read(path).expect("failed to read extracted file");

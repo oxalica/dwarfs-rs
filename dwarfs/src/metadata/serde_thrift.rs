@@ -1,11 +1,11 @@
 //! Dwarven thrift, with fbthrift flavor.
 //!
-//! This implements just enough features to handle dwarfs schema type (Frozen 2 schema).
+//! This implements just enough features to handle DwarFS schema type (Frozen 2 schema).
 //! It is and will never be standard compliant.
 //! Supported types: struct, map, string, bool, i16, i32, u32 (map/string length).
 //!
 //! Currently it will reject unsupported types thus is not future-proof. I'm not
-//! expecting it to change in the near future and dwarfs, as an on disk format,
+//! expecting it to change in the near future and DwarFS, as an on disk format,
 //! should not eagerly update its Frozen dependency.
 //!
 //! Frozen 2 schema: <https://github.com/facebook/fbthrift/blob/5a7214411bfb184c176c437f67c199d4fd50de02/thrift/lib/thrift/frozen.thrift>
