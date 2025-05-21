@@ -92,7 +92,7 @@ pub use positioned_io;
 
 /// The inclusive minimum version tuple this library supports.
 // TODO: We could lower this.
-pub const SUPPORTED_VERSION_MIN: (u8, u8) = (2, 5);
+pub const SUPPORTED_VERSION_MIN: (u8, u8) = (2, 3);
 
 /// The inclusive maximum version tuple this library supports.
 pub const SUPPORTED_VERSION_MAX: (u8, u8) = (2, 5);

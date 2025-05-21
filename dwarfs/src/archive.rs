@@ -418,9 +418,9 @@ impl ArchiveIndex {
                 bail!(ErrorInner::UnsupportedFeature(format!("{feat:?}")));
             }
         }
-        if m.dir_entries.is_none() {
-            todo!();
-        }
+        m.dir_entries
+            .is_some()
+            .or_context("dir_entries must be present since DwarFS 2.3")?;
 
         // Various `FsOptions`.
         if let Some(opts) = &m.options {
