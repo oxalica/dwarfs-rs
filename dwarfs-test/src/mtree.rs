@@ -7,6 +7,23 @@ pub fn dump(w: &mut dyn Write, index: &ArchiveIndex) -> Result<()> {
     dump_dir(w, index.root(), &mut String::from("."))
 }
 
+/// mtree escapes '/' and non-printable chars as `\ooo`.
+/// See: <https://man.archlinux.org/man/mtree.5.en>
+fn escape_into(buf: &mut String, s: &str) {
+    for &b in s.as_bytes() {
+        // ASCII printables.
+        if (33..=126).contains(&b) && !b"\\/#".contains(&b) {
+            buf.push(b as char);
+        } else {
+            buf.push('\\');
+            let digit = |x: u8| (b'0' + x) as char;
+            buf.push(digit(b / 64));
+            buf.push(digit(b / 8 % 8));
+            buf.push(digit(b % 8));
+        }
+    }
+}
+
 fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
     for only_dir in [false, true] {
         for ent in dir.entries() {
@@ -14,7 +31,7 @@ fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
             let ino = ent.inode();
             let prev_len = path.len();
             path.push('/');
-            path.push_str(name);
+            escape_into(path, name);
 
             let meta = ino.metadata();
             let mtime = meta.mtime();
