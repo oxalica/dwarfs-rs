@@ -1071,6 +1071,90 @@ impl<'a> InodeKind<'a> {
     }
 }
 
+/// The minimal wrapper of DwarFS "mode", with `Debug` and `Display` impl.
+///
+/// In DwarFS, a "mode" encodes both file type (`S_IFMT`) and
+/// permission bits, like `stat.st_mode` field from `stat(2)`.
+/// This type is named so instead of `Mode` to avoid ambiguaity.
+///
+/// See: <https://man.archlinux.org/man/inode.7.en#The_file_type_and_mode>
+///
+/// For high-level wrappers, check
+/// [`rustix::fs::Mode`](https://docs.rs/rustix/1/rustix/fs/struct.Mode.html)
+/// and
+/// [`rustix::fs::FileType`](https://docs.rs/rustix/1/rustix/fs/enum.FileType.html).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileTypeMode(pub u32);
+
+impl fmt::Debug for FileTypeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "0o{:04o}/{}", self.0, self)
+    }
+}
+
+impl fmt::Octal for FileTypeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for FileTypeMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Magic numbers are from:
+        // <https://man.archlinux.org/man/inode.7.en#The_file_type_and_mode>
+        let mut s = [0u8; 10];
+        s[0] = match self.type_bits() {
+            0o140000 => b's',
+            0o120000 => b'l',
+            0o100000 => b'-',
+            0o060000 => b'b',
+            0o040000 => b'd',
+            0o020000 => b'c',
+            0o010000 => b'p',
+            _ => b'?',
+        };
+        let fmt_perm = |s: &mut [u8], m: u32, alt: u32, altch: u8| {
+            s[0] = if m & 4 != 0 { b'r' } else { b'-' };
+            s[1] = if m & 2 != 0 { b'w' } else { b'-' };
+            let (xset, xunset) = if alt != 0 {
+                (altch, altch.to_ascii_uppercase())
+            } else {
+                (b'x', b'-')
+            };
+            s[2] = if m & 1 != 0 { xset } else { xunset };
+        };
+        let m = self.0;
+        fmt_perm(&mut s[1..4], m >> 6, m & 0o4000, b's');
+        fmt_perm(&mut s[4..7], m >> 3, m & 0o2000, b's');
+        fmt_perm(&mut s[7..10], m, m & 0o1000, b't');
+
+        f.pad(str::from_utf8(&s).expect("all ASCII"))
+    }
+}
+
+impl FileTypeMode {
+    /// Get the bits representing the file type (`S_IFMT`).
+    #[inline]
+    #[must_use]
+    pub fn type_bits(self) -> u32 {
+        self.0 & 0o170000
+    }
+
+    /// Get the bits representing the file mode (`0o7777`).
+    #[inline]
+    #[must_use]
+    pub fn mode_bits(self) -> u32 {
+        self.0 & 0o7777
+    }
+
+    /// Get the bits representing the file permissions (`0o777`).
+    #[inline]
+    #[must_use]
+    pub fn permission_bits(self) -> u32 {
+        self.0 & 0o777
+    }
+}
+
 /// The metadata of an inode.
 #[derive(Debug, Clone)]
 pub struct InodeMetadata<'a> {
@@ -1084,11 +1168,11 @@ impl<'a> InodeMetadata<'a> {
         Self { index, data }
     }
 
-    /// The mode of the inode, including file types and permissions.
+    /// The DwarFS mode of the inode, including file type and permissions.
     #[inline]
     #[must_use]
-    pub fn mode(&self) -> u32 {
-        self.index.metadata().modes[self.data.mode_index as usize]
+    pub fn file_type_mode(&self) -> FileTypeMode {
+        FileTypeMode(self.index.metadata().modes[self.data.mode_index as usize])
     }
 
     /// The owner user id (uid) of the inode.

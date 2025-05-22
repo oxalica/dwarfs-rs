@@ -35,7 +35,7 @@ fn dump_dir(w: &mut dyn Write, dir: Dir<'_>, path: &mut String) -> Result<()> {
 
             let meta = ino.metadata();
             let mtime = meta.mtime();
-            let mode = meta.mode() & 0o777;
+            let mode = meta.file_type_mode().permission_bits();
             let gid = meta.gid();
             let uid = meta.uid();
             if let Some(d) = ino.as_dir() {

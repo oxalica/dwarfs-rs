@@ -14,7 +14,7 @@
 //! // Hierarchy traversal.
 //! for entry in index.root().entries() {
 //!     let inode = entry.inode();
-//!     println!("/{} mode={}", entry.name(), inode.metadata().mode());
+//!     println!("/{} mode={}", entry.name(), inode.metadata().file_type_mode());
 //!     if let Some(deep) = inode.as_dir() {
 //!         for entry in deep.entries() {
 //!             // ...
