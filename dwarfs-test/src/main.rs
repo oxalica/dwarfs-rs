@@ -7,6 +7,7 @@ use std::{
 
 use dwarfs::{
     Archive,
+    archive::Config,
     metadata::Schema,
     section::{SectionReader, SectionType},
 };
@@ -42,6 +43,12 @@ enum Cli {
         /// If unset, contents are only read and dropped, useful for benchmarks.
         #[arg(long)]
         check: bool,
+        /// The time limit in seconds for reading.
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+        /// The block cache size in MiB.
+        #[arg(long, default_value_t = 256)]
+        block_cache: usize,
     },
 }
 
@@ -121,7 +128,12 @@ fn main() {
                 }
             }
         }
-        Cli::Read { input, check } => {
+        Cli::Read {
+            input,
+            check,
+            timeout,
+            block_cache,
+        } => {
             if cfg!(debug_assertions) {
                 panic!("refuse to run. content dump is too slow without --release");
             }
@@ -167,14 +179,22 @@ fn main() {
 
             eprintln!("reading contents");
             let file = File::open(input).expect("failed to open input file");
-            let (index, mut archive) = Archive::new(file).expect("failed to load archive");
+            let mut config = Config::default();
+            config.block_cache_size_limit(*block_cache << 20);
+            let (index, mut archive) =
+                Archive::new_with_config(file, &config).expect("failed to load archive");
             let inst = Instant::now();
-            let check_content::CheckResult { files, oks } =
-                check_content::traverse_dir(&mut archive, &index, inst, check_path.as_deref());
+            let check_content::CheckResult { files, oks } = check_content::traverse_dir(
+                &mut archive,
+                &index,
+                inst,
+                check_path.as_deref(),
+                *timeout,
+            );
             let elapsed = inst.elapsed();
             eprintln!("completed in {elapsed:?}");
 
-            println!("{files}/{oks} OK");
+            println!("{oks}/{files} OK");
             if files != oks {
                 std::process::exit(1)
             }

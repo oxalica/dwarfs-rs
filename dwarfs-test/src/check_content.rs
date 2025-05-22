@@ -2,8 +2,6 @@ use std::time::Instant;
 
 use dwarfs::{Archive, ArchiveIndex, AsChunks, positioned_io::ReadAt};
 
-const TIMEOUT_SEC: u64 = 10;
-
 #[derive(Debug)]
 pub struct CheckResult {
     pub files: u64,
@@ -15,6 +13,7 @@ pub fn traverse_dir(
     index: &ArchiveIndex,
     inst: Instant,
     check_path: Option<&str>,
+    time_limit_sec: u64,
 ) -> CheckResult {
     let do_check = check_path.is_some();
 
@@ -58,10 +57,17 @@ pub fn traverse_dir(
             }
         } else {
             std::hint::black_box(&data[..]);
+            ret.oks += 1;
         }
 
-        if inst.elapsed().as_secs() >= TIMEOUT_SEC {
-            panic!("check timeout after processed {} files", ret.files);
+        if inst.elapsed().as_secs() >= time_limit_sec {
+            panic!(
+                "check timeout after {}s, with {}/{} ({:.1}%) files processed",
+                time_limit_sec,
+                ret.files,
+                files.len(),
+                ret.files as f32 / files.len() as f32 * 100.0
+            );
         }
     }
     ret
