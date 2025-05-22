@@ -710,10 +710,10 @@ impl ArchiveIndex {
     #[inline]
     #[must_use]
     pub fn root(&self) -> Dir<'_> {
-        Dir {
+        Dir(Inode {
             index: self,
             inode_num: 0,
-        }
+        })
     }
 
     /// Get the inode under the given path from the root directory of the archive.
@@ -757,9 +757,11 @@ impl ArchiveIndex {
     #[must_use]
     pub fn directories(&self) -> impl ExactSizeIterator<Item = Dir<'_>> + DoubleEndedIterator + '_ {
         let cnt = self.inode_tally.symlink_start;
-        (0..cnt).map(|inode_num| Dir {
-            index: self,
-            inode_num,
+        (0..cnt).map(|inode_num| {
+            Dir(Inode {
+                index: self,
+                inode_num,
+            })
         })
     }
 
@@ -935,67 +937,119 @@ impl<R> Archive<R> {
     }
 }
 
-/// An inode.
+/// The trait for [`Inode`] sub-types.
+pub trait IsInode<'a>: Sized + sealed::Sealed {
+    /// Convert into a generic [`Inode`].
+    #[must_use]
+    fn to_inode(&self) -> Inode<'a>;
+
+    /// Get the inode number in the DwarFS archive.
+    #[must_use]
+    fn inode_num(&self) -> u32 {
+        self.to_inode().inode_num
+    }
+
+    /// Get the metadata of this inode.
+    #[inline]
+    #[must_use]
+    fn metadata(&self) -> InodeMetadata<'a> {
+        self.to_inode().metadata()
+    }
+}
+
+macro_rules! impl_inode_subtype {
+    ($name:ident) => {
+        impl_inode_subtype!($name, self, { self.0 });
+    };
+    ($name:ident, $self_:tt, $to_inode:block) => {
+        impl sealed::Sealed for $name<'_> {}
+        impl<'a> IsInode<'a> for $name<'a> {
+            #[inline]
+            fn to_inode(&$self_) -> Inode<'a> $to_inode
+        }
+        impl<'a> From<$name<'a>> for Inode<'a> {
+            fn from(this: $name<'a>) -> Inode<'a> {
+                this.to_inode()
+            }
+        }
+    };
+}
+
+/// A generic inode.
 #[derive(Debug, Clone, Copy)]
 pub struct Inode<'a> {
     index: &'a ArchiveIndex,
     inode_num: u32,
 }
 
-impl<'a> Inode<'a> {
-    /// Get the inode number.
+// This implementation is specialized. No need to generate `From` impls.
+impl sealed::Sealed for Inode<'_> {}
+impl<'a> IsInode<'a> for Inode<'a> {
     #[inline]
-    #[must_use]
-    pub fn inode_num(&self) -> u32 {
+    fn to_inode(&self) -> Inode<'a> {
+        *self
+    }
+
+    #[inline]
+    fn inode_num(&self) -> u32 {
         self.inode_num
     }
 
-    /// Classify this inode to an enum according to its kind.
+    #[inline]
+    fn metadata(&self) -> InodeMetadata<'a> {
+        self.metadata()
+    }
+}
+
+impl<'a> Inode<'a> {
+    /// Classify this generic inode to an enum of inode kinds.
     #[must_use]
-    pub fn classify(&self) -> InodeKind<'a> {
-        let Self { index, inode_num } = *self;
+    pub fn classify(self) -> InodeKind<'a> {
+        let Self { index, inode_num } = self;
         let t = &index.inode_tally;
         if inode_num < t.symlink_start {
-            InodeKind::Directory(Dir { index, inode_num })
+            InodeKind::Directory(Dir(self))
         } else if inode_num < t.unique_start {
-            let symlink_idx = inode_num - t.symlink_start;
-            InodeKind::Symlink(Symlink { index, symlink_idx })
-        } else if inode_num < t.shared_start {
-            let file_idx = inode_num - t.unique_start;
-            InodeKind::File(File::Unique(UniqueFile { index, file_idx }))
+            InodeKind::Symlink(Symlink(self))
         } else if inode_num < t.device_start {
-            let shared_idx = inode_num - t.shared_start;
-            InodeKind::File(File::Shared(SharedFile { index, shared_idx }))
+            InodeKind::File(File(self))
         } else if inode_num < t.ipc_start {
-            let device_idx = inode_num - t.device_start;
-            InodeKind::Device(Device { index, device_idx })
+            InodeKind::Device(Device(self))
         } else {
-            InodeKind::Ipc(Ipc { index, inode_num })
+            InodeKind::Ipc(Ipc(self))
         }
     }
 
     /// Shortcut method to check if this is a directory inode.
     #[must_use]
     pub fn is_dir(&self) -> bool {
-        self.classify().is_dir()
+        matches!(self.classify(), InodeKind::Directory(_))
     }
 
     /// Shortcut method to check if this is a regular file inode.
     #[must_use]
     pub fn is_file(&self) -> bool {
-        self.classify().is_file()
+        matches!(self.classify(), InodeKind::File(_))
     }
 
     /// Shortcut method to convert to [`Dir`] if it is a directory.
     #[must_use]
     pub fn as_dir(&self) -> Option<Dir<'a>> {
-        self.classify().as_dir()
+        if let InodeKind::Directory(dir) = self.classify() {
+            Some(dir)
+        } else {
+            None
+        }
     }
 
     /// Shortcut method to convert to [`File`] if it is a regular file.
     #[must_use]
     pub fn as_file(&self) -> Option<File<'a>> {
-        self.classify().as_file()
+        if let InodeKind::File(file) = self.classify() {
+            Some(file)
+        } else {
+            None
+        }
     }
 
     /// Get the metadata of this inode.
@@ -1021,55 +1075,15 @@ pub enum InodeKind<'a> {
     Ipc(Ipc<'a>),
 }
 
-impl<'a> From<InodeKind<'a>> for Inode<'a> {
-    fn from(i: InodeKind<'a>) -> Self {
-        match i {
-            InodeKind::Directory(i) => i.into(),
-            InodeKind::Symlink(i) => i.into(),
-            InodeKind::File(i) => i.into(),
-            InodeKind::Device(i) => i.into(),
-            InodeKind::Ipc(i) => i.into(),
-        }
+impl_inode_subtype!(InodeKind, self, {
+    match self {
+        InodeKind::Directory(i) => i.0,
+        InodeKind::Symlink(i) => i.0,
+        InodeKind::File(i) => i.0,
+        InodeKind::Device(i) => i.0,
+        InodeKind::Ipc(i) => i.0,
     }
-}
-
-impl<'a> InodeKind<'a> {
-    /// Shortcut method to convert to [`Dir`] if it is a directory.
-    #[inline]
-    #[must_use]
-    pub fn as_dir(&self) -> Option<Dir<'a>> {
-        if let Self::Directory(v) = self {
-            Some(*v)
-        } else {
-            None
-        }
-    }
-
-    /// Shortcut method to convert to [`File`] if it is a regular file.
-    #[inline]
-    #[must_use]
-    pub fn as_file(&self) -> Option<File<'a>> {
-        if let Self::File(v) = self {
-            Some(*v)
-        } else {
-            None
-        }
-    }
-
-    /// Shortcut method to check if this is a directory inode.
-    #[inline]
-    #[must_use]
-    pub fn is_dir(&self) -> bool {
-        matches!(self, Self::Directory(..))
-    }
-
-    /// Shortcut method to check if this is a regular file inode.
-    #[inline]
-    #[must_use]
-    pub fn is_file(&self) -> bool {
-        matches!(self, Self::File(..))
-    }
-}
+});
 
 /// The minimal wrapper of DwarFS "mode", with `Debug` and `Display` impl.
 ///
@@ -1156,15 +1170,16 @@ impl FileTypeMode {
 }
 
 /// The metadata of an inode.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct InodeMetadata<'a> {
     index: &'a ArchiveIndex,
-    data: metadata::InodeData,
+    // Use reference to minimize size.
+    data: &'a metadata::InodeData,
 }
 
 impl<'a> InodeMetadata<'a> {
     fn new(index: &'a ArchiveIndex, inode_num: u32) -> Self {
-        let data = index.metadata().inodes[inode_num as usize].clone();
+        let data = &index.metadata().inodes[inode_num as usize];
         Self { index, data }
     }
 
@@ -1223,26 +1238,19 @@ impl<'a> InodeMetadata<'a> {
 
 /// A directory inode.
 #[derive(Debug, Clone, Copy)]
-pub struct Dir<'a> {
-    index: &'a ArchiveIndex,
-    inode_num: u32,
-}
+pub struct Dir<'a>(Inode<'a>);
 
-impl<'a> From<Dir<'a>> for Inode<'a> {
-    fn from(Dir { index, inode_num }: Dir<'a>) -> Self {
-        Self { index, inode_num }
-    }
-}
+impl_inode_subtype!(Dir);
 
 impl<'a> Dir<'a> {
     /// Iterate all entries in this directory, in ascending order of names.
     #[inline]
     #[must_use]
     pub fn entries(&self) -> DirEntryIter<'a> {
-        let ino = self.inode_num as usize;
-        let dirs = &self.index.metadata().directories;
+        let ino = self.0.inode_num as usize;
+        let dirs = &self.0.index.metadata().directories;
         DirEntryIter {
-            index: self.index,
+            index: self.0.index,
             start: dirs[ino].first_entry,
             end: dirs[ino + 1].first_entry,
         }
@@ -1266,11 +1274,11 @@ impl<'a> Dir<'a> {
         let range = iter.start as usize..iter.end as usize;
         let idx = bisect_range_by(range, |idx| {
             Ord::cmp(
-                DirEntry::new(self.index, idx as u32).name().as_bytes(),
+                DirEntry::new(self.0.index, idx as u32).name().as_bytes(),
                 name,
             )
         })?;
-        Some(DirEntry::new(self.index, idx as u32))
+        Some(DirEntry::new(self.0.index, idx as u32))
     }
 }
 
@@ -1362,17 +1370,25 @@ macro_rules! impl_range_iterator {
 impl_range_iterator!(DirEntryIter, DirEntry);
 
 /// An entry in a directory.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DirEntry<'a> {
     index: &'a ArchiveIndex,
-    data: metadata::DirEntry,
+    // Inline `metadata::DirEntry` for `Copy`.
+    name_index: u32,
+    inode_num: u32,
 }
 
 impl<'a> DirEntry<'a> {
     fn new(index: &'a ArchiveIndex, ent_idx: u32) -> Self {
-        let data =
-            index.metadata().dir_entries.as_ref().expect("validated")[ent_idx as usize].clone();
-        Self { index, data }
+        let metadata::DirEntry {
+            name_index,
+            inode_num,
+        } = index.metadata().dir_entries.as_ref().expect("validated")[ent_idx as usize].clone();
+        Self {
+            index,
+            name_index,
+            inode_num,
+        }
     }
 
     /// Get the name of this entry.
@@ -1380,7 +1396,7 @@ impl<'a> DirEntry<'a> {
     #[must_use]
     pub fn name(&self) -> &'a str {
         let m = self.index.metadata();
-        ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, self.data.name_index)
+        ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, self.name_index)
     }
 
     /// Get the inode of this entry.
@@ -1389,172 +1405,83 @@ impl<'a> DirEntry<'a> {
     pub fn inode(&self) -> Inode<'a> {
         Inode {
             index: self.index,
-            inode_num: self.data.inode_num,
+            inode_num: self.inode_num,
         }
     }
 }
 
 /// A symlink inode.
 #[derive(Debug, Clone, Copy)]
-pub struct Symlink<'a> {
-    index: &'a ArchiveIndex,
-    symlink_idx: u32,
-}
+pub struct Symlink<'a>(Inode<'a>);
 
-impl<'a> From<Symlink<'a>> for Inode<'a> {
-    fn from(i: Symlink<'a>) -> Self {
-        Self {
-            index: i.index,
-            inode_num: i.index.inode_tally.symlink_start + i.symlink_idx,
-        }
-    }
-}
+impl_inode_subtype!(Symlink);
 
 impl<'a> Symlink<'a> {
     /// Get the target of this symlink.
     #[inline]
     #[must_use]
     pub fn target(&self) -> &'a str {
-        let m = self.index.metadata();
-        let tgt_idx = m.symlink_table[self.symlink_idx as usize];
+        let m = self.0.index.metadata();
+        let symlink_idx = self.0.inode_num - self.0.index.inode_tally.symlink_start;
+        let tgt_idx = m.symlink_table[symlink_idx as usize];
         ArchiveIndex::get_from_string_table(&m.symlinks, &m.compact_symlinks, tgt_idx)
     }
 }
 
 /// A character or block device inode.
+///
+/// To distinguish from block device and character device, you can call
+/// [`metadata()`][IsInode::metadata] and check
+/// [`file_type_mode()`][InodeMetadata::file_type_mode] for its file type.
 #[derive(Debug, Clone, Copy)]
-pub struct Device<'a> {
-    index: &'a ArchiveIndex,
-    device_idx: u32,
-}
+pub struct Device<'a>(Inode<'a>);
 
-impl<'a> From<Device<'a>> for Inode<'a> {
-    fn from(i: Device<'a>) -> Self {
-        Self {
-            index: i.index,
-            inode_num: i.index.inode_tally.device_start + i.device_idx,
-        }
-    }
-}
+impl_inode_subtype!(Device);
 
 impl Device<'_> {
     /// Get the device id this special inode represents.
     #[inline]
     #[must_use]
     pub fn device_id(&self) -> u64 {
-        self.index.metadata().devices.as_ref().expect("validated")[self.device_idx as usize]
+        let device_idx = self.0.inode_num - self.0.index.inode_tally.device_start;
+        self.0.index.metadata().devices.as_ref().expect("validated")[device_idx as usize]
     }
 }
 
 /// A pipe or socket inode.
+///
+/// To distinguish from pipe and socket inodes, you can call
+/// [`metadata()`][IsInode::metadata] and check
+/// [`file_type_mode()`][InodeMetadata::file_type_mode] for its file type.
 #[derive(Debug, Clone, Copy)]
-pub struct Ipc<'a> {
-    index: &'a ArchiveIndex,
-    inode_num: u32,
-}
+pub struct Ipc<'a>(Inode<'a>);
 
-impl<'a> From<Ipc<'a>> for Inode<'a> {
-    fn from(Ipc { index, inode_num }: Ipc<'a>) -> Self {
-        Self { index, inode_num }
-    }
-}
+impl_inode_subtype!(Ipc);
 
 /// A regular file inode.
 ///
 /// This type implements [`AsChunks`], you can call
 /// [`as_chunks`][AsChunks::as_chunks] or [`read_to_vec`][AsChunks::read_to_vec]
-/// directly on `File` to get its content, without caring about its underlying
-/// representation (shared or unique).
+/// to read its content.
 #[derive(Debug, Clone, Copy)]
-pub enum File<'a> {
-    /// See [`UniqueFile`].
-    Unique(UniqueFile<'a>),
-    /// See [`SharedFile`].
-    Shared(SharedFile<'a>),
-}
+pub struct File<'a>(Inode<'a>);
 
-impl<'a> From<File<'a>> for Inode<'a> {
-    fn from(f: File<'a>) -> Self {
-        match f {
-            File::Unique(f) => f.into(),
-            File::Shared(f) => f.into(),
-        }
-    }
-}
+impl_inode_subtype!(File);
 
-impl sealed::Sealed for File<'_> {}
 impl<'a> AsChunks<'a> for File<'a> {
     fn as_chunks(&self) -> ChunkIter<'a> {
-        match self {
-            File::Unique(f) => f.as_chunks(),
-            File::Shared(f) => f.as_chunks(),
-        }
-    }
-}
-
-/// A file inode whose content is unique in the archive.
-#[derive(Debug, Clone, Copy)]
-pub struct UniqueFile<'a> {
-    index: &'a ArchiveIndex,
-    file_idx: u32,
-}
-
-impl<'a> From<UniqueFile<'a>> for Inode<'a> {
-    fn from(i: UniqueFile<'a>) -> Self {
-        Self {
-            index: i.index,
-            inode_num: i.index.inode_tally.unique_start + i.file_idx,
-        }
-    }
-}
-
-impl sealed::Sealed for UniqueFile<'_> {}
-impl<'a> AsChunks<'a> for UniqueFile<'a> {
-    fn as_chunks(&self) -> ChunkIter<'a> {
-        let tbl = &self.index.metadata().chunk_table;
-        let chunk_start = tbl[self.file_idx as usize];
-        let chunk_end = tbl[self.file_idx as usize + 1];
+        let tally = &self.0.index.inode_tally;
+        let m = self.0.index.metadata();
+        let file_idx = if let Some(shared_idx) = self.0.inode_num.checked_sub(tally.shared_start) {
+            m.shared_files_table.as_ref().expect("validated")[shared_idx as usize]
+                + tally.unique_cnt
+        } else {
+            self.0.inode_num - tally.unique_start
+        };
         ChunkIter {
-            index: self.index,
-            start: chunk_start,
-            end: chunk_end,
-        }
-    }
-}
-
-/// A file whose content is deduplicated and merged with other files in the
-/// archive.
-///
-/// Note that this is content-based deduplication and has nothing to do with
-/// hard links, which is represented as a single inode referenced by
-/// multiple [`DirEntry`]s.
-#[derive(Debug, Clone, Copy)]
-pub struct SharedFile<'a> {
-    index: &'a ArchiveIndex,
-    shared_idx: u32,
-}
-
-impl<'a> From<SharedFile<'a>> for Inode<'a> {
-    fn from(i: SharedFile<'a>) -> Self {
-        Self {
-            index: i.index,
-            inode_num: i.index.inode_tally.shared_start + i.shared_idx,
-        }
-    }
-}
-
-impl sealed::Sealed for SharedFile<'_> {}
-impl<'a> AsChunks<'a> for SharedFile<'a> {
-    fn as_chunks(&self) -> ChunkIter<'a> {
-        let m = self.index.metadata();
-        let file_idx = self.index.inode_tally.unique_cnt
-            + m.shared_files_table.as_ref().expect("validated")[self.shared_idx as usize];
-        let chunk_start = m.chunk_table[file_idx as usize];
-        let chunk_end = m.chunk_table[file_idx as usize + 1];
-        ChunkIter {
-            index: self.index,
-            start: chunk_start,
-            end: chunk_end,
+            index: self.0.index,
+            start: m.chunk_table[file_idx as usize],
+            end: m.chunk_table[file_idx as usize + 1],
         }
     }
 }
@@ -1584,20 +1511,29 @@ impl<'a> AsChunks<'a> for ChunkIter<'a> {
 impl_range_iterator!(ChunkIter, Chunk);
 
 /// The description of a chunk of bytes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Chunk<'a> {
     index: &'a ArchiveIndex,
-    data: metadata::Chunk,
+    // Inline `metadata::Chunk` for `Copy`.
+    block: u32,
+    offset: u32,
+    size: u32,
     // For `HasChunks` impl.
     chunk_idx: u32,
 }
 
 impl<'a> Chunk<'a> {
     fn new(index: &'a ArchiveIndex, chunk_idx: u32) -> Self {
-        let data = index.metadata().chunks[chunk_idx as usize].clone();
+        let metadata::Chunk {
+            block,
+            offset,
+            size,
+        } = index.metadata().chunks[chunk_idx as usize].clone();
         Self {
-            data,
             index,
+            block,
+            offset,
+            size,
             chunk_idx,
         }
     }
@@ -1606,21 +1542,21 @@ impl<'a> Chunk<'a> {
     #[inline]
     #[must_use]
     pub fn section_idx(&self) -> u32 {
-        self.data.block
+        self.block
     }
 
     /// Get the start offset of chunk data in the decompressed section payload.
     #[inline]
     #[must_use]
     pub fn offset(&self) -> u32 {
-        self.data.offset
+        self.offset
     }
 
     /// Get the byte size of this chunk.
     #[inline]
     #[must_use]
     pub fn size(&self) -> u32 {
-        self.data.size
+        self.size
     }
 
     /// Read this chunk into [`Archive`]'s cache if needed and return the bytes.

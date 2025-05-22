@@ -101,7 +101,7 @@ use std::{cmp::Ordering, ops::Range};
 
 pub use archive::{
     Archive, ArchiveIndex, AsChunks, Device, Dir, DirEntry, Error, File, Inode, InodeKind,
-    InodeMetadata, Ipc, Result, SharedFile, Symlink, UniqueFile,
+    InodeMetadata, Ipc, Result, Symlink,
 };
 
 /// There is currently no binary search functions in std over a generic range.
