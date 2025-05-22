@@ -1,4 +1,6 @@
-//! Library for reading [DwarFS][dwarfs] archives (aka. images).
+//! A library for reading [DwarFS][dwarfs] archives (aka. images).
+//!
+//! Currently, DwarFS filesystem version 2.3..=2.5 is supported.
 //!
 //! [dwarfs]: https://github.com/mhx/dwarfs
 //!

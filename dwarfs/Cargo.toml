@@ -1,9 +1,11 @@
 [package]
 name = "dwarfs"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
-description = "WIP"
+description = "A library for reading DwarFS archives (aka. DwarFS images)"
 license = "MIT OR Apache-2.0"
+keywords = ["dwarfs", "archive", "compression"]
+categories = ["compression", "filesystem"]
 
 [features]
 default = ["zstd", "log"]

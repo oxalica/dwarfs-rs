@@ -3,6 +3,7 @@ name = "dwarfs-test"
 version = "0.0.0"
 edition = "2024"
 publish = false
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 clap = { version = "4.5.38", features = ["derive"] }
