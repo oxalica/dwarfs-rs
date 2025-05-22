@@ -157,7 +157,7 @@ pub enum SectionIndexStrategy {
     UseEmbedded,
     /// Use embedded section index, or build our own if it does not exist.
     ///
-    /// The default strategy, balacing between performance and compatibility.
+    /// The default strategy, balancing between performance and compatibility.
     #[default]
     UseEmbeddedIfExists,
     /// Never use embedded section index but always build our own.
@@ -1678,10 +1678,10 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
 
     /// Read all data from this object into a `Vec`.
     ///
-    /// This is a convenient shortcut method, but might be less efficient than
-    /// [`Read::read_to_end`] because it forces an allocation.
+    /// This is a convenient shortcut method wrapping [`AsChunks::as_reader`]
+    /// and [`Read::read_to_end`].
     ///
-    /// See [`AsChunks::as_reader`] for the validity requirement on `archiev`.
+    /// See [`AsChunks::as_reader`] for the validity requirement on `archive`.
     fn read_to_vec<R: ReadAt + ?Sized>(
         &self,
         archive: &mut Archive<R>,
