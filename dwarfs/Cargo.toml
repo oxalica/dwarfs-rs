@@ -6,6 +6,7 @@ description = "A library for reading DwarFS archives (aka. DwarFS images)"
 license = "MIT OR Apache-2.0"
 keywords = ["dwarfs", "archive", "compression"]
 categories = ["compression", "filesystem"]
+repository = "https://github.com/oxalica/dwarfs-rs"
 
 [features]
 default = ["zstd", "log"]

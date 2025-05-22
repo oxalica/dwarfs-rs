@@ -20,7 +20,7 @@ use positioned_io::ReadAt;
 use xxhash_rust::xxh3::Xxh3Default;
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, little_endian as le};
 
-use crate::{SUPPORTED_VERSION_MAX, SUPPORTED_VERSION_MIN};
+use crate::SUPPORTED_VERSION_RANGE;
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -256,18 +256,16 @@ impl MagicVersion {
     /// # Errors
     ///
     /// Returns `Err` if the magic does not match [`MAGIC`](Self::MAGIC), or the
-    /// specified DwarFS version is outside the supported range
-    /// [`SUPPORTED_VERSION_MIN`]..=[`SUPPORTED_VERSION_MAX`].
+    /// specified DwarFS version is outside [`SUPPORTED_VERSION_RANGE`].
     pub fn validate(self) -> Result<()> {
         let ver = (self.major, self.minor);
         if self.magic != Self::MAGIC {
             bail!(ErrorInner::InvalidMagic(self.magic));
         }
-        if SUPPORTED_VERSION_MIN <= ver && ver <= SUPPORTED_VERSION_MAX {
-            Ok(())
-        } else {
-            bail!(ErrorInner::UnsupportedVersion(ver.0, ver.1))
+        if !SUPPORTED_VERSION_RANGE.contains(&ver) {
+            bail!(ErrorInner::UnsupportedVersion(ver.0, ver.1));
         }
+        Ok(())
     }
 }
 
