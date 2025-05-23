@@ -34,7 +34,8 @@ impl fmt::Debug for Error {
 }
 
 #[derive(Debug)]
-#[non_exhaustive]
+// Variants may never be constructed without relevant features enabled.
+#[cfg_attr(not(feature = "default"), allow(dead_code))]
 enum ErrorInner {
     // Header.
     InvalidMagic([u8; 6]),
