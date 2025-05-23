@@ -21,8 +21,11 @@ use std::{borrow::Borrow, fmt, marker::PhantomData, ops};
 use bstr::BString;
 use serde::{Deserialize, Serialize, de};
 
-mod serde_frozen;
-mod serde_thrift;
+mod de_frozen;
+mod de_thrift;
+
+#[cfg(feature = "serialize")]
+mod ser_thrift;
 
 #[cfg(test)]
 mod tests;
@@ -200,7 +203,7 @@ impl Schema {
     /// basic invariant validations. Currently only index ranges are checked,
     /// the validated invariants may change in the future.
     pub fn parse(input: &[u8]) -> Result<Self> {
-        let this = serde_thrift::deserialize_struct::<Self>(input)
+        let this = de_thrift::deserialize_struct::<Self>(input)
             .map_err(|err| Error(format!("failed to parse schema: {err}").into()))?;
         this.validate()?;
         Ok(this)
@@ -220,8 +223,9 @@ impl Schema {
     ///
     /// Returns `Err` if serialization fails. Currently this can happen on
     /// overly large collections whose length exceeds `i32::MAX`.
+    #[cfg(feature = "serialize")]
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        serde_thrift::serialize_struct(self)
+        ser_thrift::serialize_struct(self)
             .map_err(|err| Error(format!("failed to serialize schema: {err}").into()))
     }
 
@@ -420,7 +424,7 @@ impl Metadata {
     /// optmisticly accept some "semantically invalid" `Metadata`.
     /// The tolorence on invalid parts may change in the future.
     pub fn parse(schema: &Schema, bytes: &[u8]) -> Result<Self> {
-        serde_frozen::deserialize(schema, bytes)
+        de_frozen::deserialize(schema, bytes)
             .map_err(|err| Error(format!("failed to parse metadata: {err}").into()))
     }
 }

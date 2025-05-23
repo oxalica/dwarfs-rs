@@ -1,6 +1,7 @@
 use super::*;
 
 #[test]
+#[cfg(feature = "serialize")]
 fn serde_schema() {
     let schema = Schema {
         relax_type_checks: true,
@@ -82,7 +83,7 @@ fn de_frozen() {
         file_version: 1,
     };
 
-    let de = super::serde_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
+    let de = super::de_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
     assert_eq!(
         de,
         Pair {
