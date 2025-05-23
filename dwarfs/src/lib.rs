@@ -94,6 +94,7 @@ pub mod metadata;
 pub mod section;
 
 pub extern crate positioned_io;
+pub extern crate zerocopy;
 
 /// The range of filesystem version tuple `(major, minor)` supported by this library.
 ///

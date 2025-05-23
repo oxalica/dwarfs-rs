@@ -161,6 +161,23 @@ impl fmt::Debug for Header {
 }
 
 impl Header {
+    /// Calculate section checksum of header and payload using the "fast" XXH3-64 hash.
+    ///
+    /// Note: this will also hash part of the header.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the length of `payload` disagree with the header.
+    pub fn calculate_fast_checksum(&self, payload: &[u8]) -> Result<[u8; 8]> {
+        if payload.len() as u64 != self.payload_size.get() {
+            bail!(ErrorInner::LengthMismatch);
+        }
+        let mut h = Xxh3Default::new();
+        h.update(&self.as_bytes()[offset_of!(Self, section_number)..]);
+        h.update(payload);
+        Ok(h.digest().to_le_bytes())
+    }
+
     /// Validate section checksum of header and payload using the "fast" XXH3-64 hash.
     ///
     /// # Errors
@@ -168,16 +185,32 @@ impl Header {
     /// Returns `Err` if the length of `payload` disagree with the header, or the
     /// checksum mismatches.
     pub fn validate_fast_checksum(&self, payload: &[u8]) -> Result<()> {
-        if payload.len() as u64 != self.payload_size.get() {
-            bail!(ErrorInner::LengthMismatch);
-        }
-        let mut h = Xxh3Default::new();
-        h.update(&self.as_bytes()[offset_of!(Self, section_number)..]);
-        h.update(payload);
-        if h.digest() != u64::from_le_bytes(self.fast_hash) {
+        let h = self.calculate_fast_checksum(payload)?;
+        if h != self.fast_hash {
             bail!(ErrorInner::ChecksumMismatch);
         }
         Ok(())
+    }
+
+    /// Calculate section checksum of header and payload using the "slow" SHA2-512/256 hash.
+    ///
+    /// Note: this will also hash part of the header, including `fast_hash` field.
+    /// If you are filling checksums in the header, you must fill `fast_hash`
+    /// before calculating `slow_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the length of `payload` disagree with the header.
+    pub fn calculate_slow_checksum(&self, payload: &[u8]) -> Result<[u8; 32]> {
+        use sha2::Digest;
+
+        if payload.len() as u64 != self.payload_size.get() {
+            bail!(ErrorInner::LengthMismatch);
+        }
+        let mut h = sha2::Sha512_256::new();
+        h.update(&self.as_bytes()[offset_of!(Self, fast_hash)..]);
+        h.update(payload);
+        Ok(*h.finalize().as_ref())
     }
 
     /// Validate section checksum of header and payload using the "slow" SHA2-512/256 hash.
@@ -187,15 +220,8 @@ impl Header {
     /// Returns `Err` if the length of `payload` disagree with the header, or the
     /// checksum mismatches.
     pub fn validate_slow_checksum(&self, payload: &[u8]) -> Result<()> {
-        use sha2::Digest;
-
-        if payload.len() as u64 != self.payload_size.get() {
-            bail!(ErrorInner::LengthMismatch);
-        }
-        let mut h = sha2::Sha512_256::new();
-        h.update(&self.as_bytes()[offset_of!(Self, fast_hash)..]);
-        h.update(payload);
-        if h.finalize()[..] != self.slow_hash {
+        let h = self.calculate_slow_checksum(payload)?;
+        if h != self.slow_hash {
             bail!(ErrorInner::ChecksumMismatch);
         }
         Ok(())
