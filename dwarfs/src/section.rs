@@ -55,6 +55,7 @@ enum ErrorInner {
         got: Option<u64>,
     },
     Decompress(std::io::Error),
+    MalformedSectionIndex(String),
 
     // Other.
     Io(std::io::Error),
@@ -93,6 +94,9 @@ impl fmt::Display for Error {
             }
             ErrorInner::PayloadTooLong { limit, got: None } => {
                 write!(f, "section payload exceeds the limit of {limit} bytes")
+            }
+            ErrorInner::MalformedSectionIndex(msg) => {
+                write!(f, "malformed section index: {msg}")
             }
 
             ErrorInner::Decompress(err) => write!(f, "failed to decompress section payload: {err}"),
@@ -802,16 +806,31 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         self.rdr
             .read_exact_at(index_header_offset + HEADER_SIZE, buf_bytes)?;
 
-        // Final validation for content.
-        if header.validate_fast_checksum(buf_bytes).is_err() {
-            return Ok(None);
-        }
-        let mut prev = 0u64;
-        for ent in &entries {
-            if !ent.section_type().is_known() || prev >= ent.offset() {
-                return Ok(None);
+        // Here, the section passes attribute precondition test. We are almost
+        // certain an index is indeed present because we cannot "collide" so
+        // many preconditions (especially, the section offset) by chance.
+        //
+        // So below this line, we assume its presence, and emit errors instead
+        // of returning `Ok(None)` to alert users there must be something going
+        // wrong: either the index is broken, or the input is "maliciously"
+        // tricking us.
+
+        header.validate_fast_checksum(buf_bytes)?;
+
+        let mut prev = None;
+        for (i, ent) in entries.iter().enumerate() {
+            let (typ, offset) = (ent.section_type(), ent.offset());
+            if !typ.is_known() {
+                bail!(ErrorInner::MalformedSectionIndex(format!(
+                    "entry {i} has unknown section type {typ:?}",
+                )))
             }
-            prev = ent.offset();
+            if prev.is_some_and(|prev| prev >= offset) {
+                bail!(ErrorInner::MalformedSectionIndex(format!(
+                    "entry {i} has unsorted offset {offset} >= previous offset {prev:?}",
+                )));
+            }
+            prev = Some(offset)
         }
 
         Ok(Some((header, entries)))
