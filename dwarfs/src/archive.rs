@@ -14,7 +14,6 @@ use lru::LruCache;
 use positioned_io::{ReadAt, Size};
 
 use crate::{
-    bisect_range_by,
     fsst::Decoder as FsstDecoder,
     metadata::{self, Error as ParserMetadataError, Metadata, Schema, StringTable},
     section::{self, HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
@@ -1270,15 +1269,16 @@ impl<'a> Dir<'a> {
     }
 
     fn get_inner(&self, name: &[u8]) -> Option<DirEntry<'a>> {
-        let iter = self.entries();
-        let range = iter.start as usize..iter.end as usize;
-        let idx = bisect_range_by(range, |idx| {
-            Ord::cmp(
-                DirEntry::new(self.0.index, idx as u32).name().as_bytes(),
-                name,
-            )
-        })?;
-        Some(DirEntry::new(self.0.index, idx as u32))
+        let DirEntryIter { start, end, .. } = self.entries();
+        let m = self.0.index.metadata();
+        let entries = &m.dir_entries.as_ref().expect("validated")[start as usize..end as usize];
+        let idx = entries
+            .binary_search_by_key(&name, |ent| {
+                ArchiveIndex::get_from_string_table(&m.names, &m.compact_names, ent.name_index)
+                    .as_bytes()
+            })
+            .ok()?;
+        Some(DirEntry::new(self.0.index, &entries[idx]))
     }
 }
 
@@ -1303,7 +1303,7 @@ macro_rules! impl_range_iterator {
             #[inline]
             fn next(&mut self) -> Option<Self::Item> {
                 if self.start < self.end {
-                    let ent = $item::new(self.index, self.start);
+                    let ent = $item::new_idx(self.index, self.start);
                     self.start += 1;
                     Some(ent)
                 } else {
@@ -1315,7 +1315,7 @@ macro_rules! impl_range_iterator {
             fn nth(&mut self, n: usize) -> Option<Self::Item> {
                 if n < self.len() {
                     self.start += n as u32 + 1;
-                    Some($item::new(self.index, self.start - 1))
+                    Some($item::new_idx(self.index, self.start - 1))
                 } else {
                     self.start = self.end;
                     None
@@ -1336,7 +1336,7 @@ macro_rules! impl_range_iterator {
             fn next_back(&mut self) -> Option<Self::Item> {
                 if self.start < self.end {
                     self.end -= 1;
-                    let ent = $item::new(self.index, self.end);
+                    let ent = $item::new_idx(self.index, self.end);
                     Some(ent)
                 } else {
                     None
@@ -1347,7 +1347,7 @@ macro_rules! impl_range_iterator {
             fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
                 if n < self.len() {
                     self.end -= n as u32 + 1;
-                    Some($item::new(self.index, self.end))
+                    Some($item::new_idx(self.index, self.end))
                 } else {
                     self.end = self.start;
                     None
@@ -1379,16 +1379,17 @@ pub struct DirEntry<'a> {
 }
 
 impl<'a> DirEntry<'a> {
-    fn new(index: &'a ArchiveIndex, ent_idx: u32) -> Self {
-        let metadata::DirEntry {
-            name_index,
-            inode_num,
-        } = index.metadata().dir_entries.as_ref().expect("validated")[ent_idx as usize].clone();
+    fn new(index: &'a ArchiveIndex, ent: &metadata::DirEntry) -> Self {
         Self {
             index,
-            name_index,
-            inode_num,
+            name_index: ent.name_index,
+            inode_num: ent.inode_num,
         }
+    }
+
+    fn new_idx(index: &'a ArchiveIndex, idx: u32) -> Self {
+        let entries = index.metadata().dir_entries.as_deref().expect("validated");
+        Self::new(index, &entries[idx as usize])
     }
 
     /// Get the name of this entry.
@@ -1523,7 +1524,7 @@ pub struct Chunk<'a> {
 }
 
 impl<'a> Chunk<'a> {
-    fn new(index: &'a ArchiveIndex, chunk_idx: u32) -> Self {
+    fn new_idx(index: &'a ArchiveIndex, chunk_idx: u32) -> Self {
         let metadata::Chunk {
             block,
             offset,
