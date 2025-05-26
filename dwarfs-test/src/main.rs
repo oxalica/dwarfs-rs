@@ -144,18 +144,14 @@ fn main() {
                     let expect = cmd!(sh, "dwarfsextract -i {input} -f mtree")
                         .read()
                         .expect("failed to run 'dwarfsextract'");
+                    let expected = expect.trim_ascii_end();
+                    let actual = got.trim_ascii_end();
 
-                    if expect == got {
+                    if expected == actual {
                         println!("OK");
                     } else {
                         println!("Output differs");
-                        println!(
-                            "{}",
-                            colored_diff::PrettyDifference {
-                                expected: &expect,
-                                actual: &got,
-                            }
-                        );
+                        println!("{}", colored_diff::PrettyDifference { expected, actual });
                         std::process::exit(1)
                     }
                 }
