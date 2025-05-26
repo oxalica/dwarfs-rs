@@ -13,6 +13,9 @@ type Sym = u64;
 const VERSION: u32 = 2019_0218;
 const SYM_CORRUPT: Sym = u64::from_ne_bytes(*b"corrupt\0");
 
+/// The max length of one symbol.
+pub const MAX_SYMBOL_LEN: usize = 8;
+
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A symbol table decoding error.
@@ -27,6 +30,10 @@ enum ErrorInner {
 
     BufTooSmall,
     InvalidEscape,
+    InvalidSymbol,
+
+    #[cfg(feature = "serialize")]
+    IncorrectSymbolOrder,
 }
 
 impl fmt::Debug for Error {
@@ -44,6 +51,9 @@ impl fmt::Display for Error {
             ErrorInner::CodeOverflow => "too many symbols",
             ErrorInner::BufTooSmall => "output buffer is too small",
             ErrorInner::InvalidEscape => "invalid escape byte at the end of input",
+            ErrorInner::InvalidSymbol => "invalid symbol",
+            #[cfg(feature = "serialize")]
+            ErrorInner::IncorrectSymbolOrder => "symbols must be ordered in length 2,3,4,5,6,7,8,1",
         })
     }
 }
@@ -91,7 +101,17 @@ impl fmt::Debug for Decoder {
 
 impl Decoder {
     /// The max length of one symbol.
-    pub const MAX_SYMBOL_LEN: usize = 8;
+    pub const MAX_SYMBOL_LEN: usize = MAX_SYMBOL_LEN;
+
+    const ALL_CORRUPT: Self = Decoder {
+        symbols: [SYM_CORRUPT; 255],
+    };
+
+    /// Iterate over `len_histo` for (symbol_length, count).
+    fn len_histo_iter(histo: &[u8; 8]) -> impl Iterator<Item = (usize, u8)> {
+        // Semantically: zip([2,3,4,5,6,7,8,1], histo[...[1,2,3,4,5,6,7,0]])
+        (1..=8).map(|i| ((i & 7) + 1, histo[i & 7]))
+    }
 
     /// Parse the symbol table `symtab`, from the serialization format from libfstt.
     ///
@@ -112,9 +132,7 @@ impl Decoder {
     ///
     /// Returns `None` if the input cannot be successfully parsed.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut this = Self {
-            symbols: [SYM_CORRUPT; 255],
-        };
+        let mut this = Self::ALL_CORRUPT;
 
         let (&version_bytes, rest) = bytes.split_first_chunk::<8>().ok_or(ErrorInner::InputEof)?;
         let (&zero_terminated, rest) = rest.split_first().ok_or(ErrorInner::InputEof)?;
@@ -141,8 +159,7 @@ impl Decoder {
 
         let mut code = 0;
         let mut pos = 0;
-        for sym_len in [2, 3, 4, 5, 6, 7, 8, 1] {
-            let cnt = len_histo[sym_len - 1];
+        for (sym_len, cnt) in Self::len_histo_iter(&len_histo) {
             for _ in 0..cnt {
                 let mut sym = 0u64;
                 // TODO: Bound check before?
@@ -195,10 +212,13 @@ impl Decoder {
         let prev_output_len = output.len();
         let mut i = 0;
         // The second condition is a loop invariant, not an exit condition.
-        while i < input.len() && output.len() >= Self::MAX_SYMBOL_LEN {
+        while i < input.len() && output.len() >= MAX_SYMBOL_LEN {
             let b = input[i];
             if b < 0xFF {
                 let sym = self.symbols[b as usize];
+                if sym == 0 {
+                    return Err(ErrorInner::InvalidSymbol.into());
+                }
                 // We always use max possible decode length, so output[..8] will never fail.
                 *output.first_chunk_mut().expect("loop invariant") = sym.to_ne_bytes();
                 output = &mut output[Self::symbol_len(sym)..];
@@ -225,6 +245,67 @@ impl Decoder {
         buf.truncate(len);
         Ok(buf.into())
     }
+}
+
+/// Serialize symbol table consists of given symbols into bytes.
+///
+/// `symbols` is an iterator of FSST symbols for code `0..`. It must be ordered
+/// in length `2,3,4,5,6,7,8,1`.
+///
+/// # Errors
+///
+/// Returns `Err` if either:
+/// - `symbols` has are more than 255 elements, or not in the expected order.
+/// - A symbol has length outside range `1..=8`.
+/// - A symbol contains a zero (NUL) byte.
+#[cfg(feature = "serialize")]
+pub fn to_bytes<I>(symbols: I) -> Result<Vec<u8>>
+where
+    I: IntoIterator,
+    I::Item: AsRef<[u8]>,
+{
+    let mut tbl = [0u64; 255];
+    let mut len_histo = [0u8; 8];
+    let mut prev_len_order = 0usize;
+    let mut code = 0usize;
+    for bytes in symbols {
+        if code >= 0xFF {
+            return Err(ErrorInner::CodeOverflow.into());
+        }
+        let bytes = bytes.as_ref();
+        let len = bytes.len();
+        if !(1..=8).contains(&len) || bytes.contains(&0) {
+            return Err(ErrorInner::InvalidSymbol.into());
+        }
+        // 23456781 => 0123456MAX
+        let len_order = len.wrapping_sub(2);
+        if prev_len_order > len_order {
+            return Err(ErrorInner::IncorrectSymbolOrder.into());
+        }
+        prev_len_order = len_order;
+
+        let mut sym = 0u64;
+        sym.as_mut_bytes()[..len].copy_from_slice(bytes);
+        tbl[code] = sym;
+        code += 1;
+        len_histo[len - 1] += 1;
+    }
+
+    let mut out = Vec::with_capacity(8 + 1 + 8 + MAX_SYMBOL_LEN * 255);
+    // Magic bytes, with no parameters set.
+    let magic = u64::from(VERSION) << 32 | 0xFF;
+    out.extend_from_slice(&magic.to_le_bytes());
+    // Disable `zero_terminated` mode.
+    out.push(0x00);
+    // Lengths.
+    out.extend_from_slice(&len_histo);
+
+    for sym in &tbl[..code] {
+        let len = Decoder::symbol_len(*sym);
+        out.extend_from_slice(&sym.as_bytes()[..len]);
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -255,5 +336,26 @@ mod tests {
 
         let got = tbl.decode(b"\0\xFF,\0").unwrap();
         assert_eq!(got, "hello,hello");
+    }
+
+    #[test]
+    #[cfg(feature = "serialize")]
+    fn serialize() {
+        let bytes = to_bytes([&b"hello"[..], b"world", b"!"]).unwrap();
+        let tbl = Decoder::parse(&bytes).unwrap();
+        assert_eq!(tbl.decode(b"\0\xFF,\x01\x02").unwrap(), "hello,world!");
+
+        assert_eq!(
+            to_bytes([&b"!"[..], b"hello"]).unwrap_err().to_string(),
+            "symbols must be ordered in length 2,3,4,5,6,7,8,1",
+        );
+        assert_eq!(
+            to_bytes([b"123456789"]).unwrap_err().to_string(),
+            "invalid symbol",
+        );
+        assert_eq!(
+            to_bytes(&[b"a"].repeat(256)).unwrap_err().to_string(),
+            "too many symbols",
+        );
     }
 }

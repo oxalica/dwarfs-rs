@@ -53,8 +53,9 @@
 //!
 //! - `serialize` *(Disabled by default)*
 //!
-//!   Enable serialization support for various structures. Currently, it only
-//!   includes [`metadata::Schema::to_bytes`].
+//!   Enable serialization support for various structures. It enables:
+//!   - [`metadata::Schema::to_bytes`]
+//!   - [`fsst::to_bytes`]
 //!
 //! [log]: https://crates.io/crates/log
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
