@@ -417,9 +417,13 @@ impl ArchiveIndex {
                 bail!(ErrorInner::UnsupportedFeature(format!("{feat:?}")));
             }
         }
-        m.dir_entries
-            .is_some()
-            .or_context("dir_entries must be present since DwarFS 2.3")?;
+
+        let dir_entries = m
+            .dir_entries
+            .as_ref()
+            // The first entry is for the root directory.
+            .filter(|ents| !ents.is_empty())
+            .context("dir_entries must be present since DwarFS 2.3")?;
 
         // Various `FsOptions`.
         if let Some(opts) = &m.options {
@@ -629,7 +633,7 @@ impl ArchiveIndex {
                     .context("offset out of range in chunks")?;
             }
 
-            let entries = m.dir_entries.as_ref().expect("validated").len() as u32;
+            let entries = dir_entries.len() as u32;
             for d in &m.directories {
                 check!(d.first_entry <= entries, "directories.first_entry");
                 check!(d.parent_entry <= entries, "directories.parent_entry");
@@ -680,10 +684,13 @@ impl ArchiveIndex {
                 .as_ref()
                 .map_or(m.names.len(), |tbl| tbl.index.len().saturating_sub(1))
                 as u32;
-            for ent in m.dir_entries.as_ref().expect("validated") {
+            // The root entry's `name_index` is a placeholder and must not be used.
+            for ent in &dir_entries[1..] {
                 check!(ent.inode_num < inodes, "dir_entries.inode_num");
                 check!(ent.name_index < names, "dir_entries.name_index");
             }
+
+            (dir_entries[0].inode_num == 0).or_context("invalid dir_entries[0].inode_num")?;
         }
 
         Ok(())
