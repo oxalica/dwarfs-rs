@@ -324,6 +324,8 @@ fn symtab() {
     let (sh, _temp_dir) = new_temp_shell();
     let names = (0..32)
         .map(|i| format!("a_very_common_prefix.{i:02}.txt"))
+        // Single occurrence byte.
+        .chain(["~".to_owned()])
         .collect::<Vec<_>>();
 
     for name in &names {

@@ -14,7 +14,7 @@ use lru::LruCache;
 use positioned_io::{ReadAt, Size};
 
 use crate::{
-    fsst::Decoder as FsstDecoder,
+    fsst,
     metadata::{self, Error as ParserMetadataError, Metadata, Schema, StringTable},
     section::{self, HEADER_SIZE, SectionIndexEntry, SectionReader, SectionType},
 };
@@ -35,6 +35,7 @@ enum ErrorInner {
     MissingSection(SectionType),
     DuplicatedSection(SectionType),
     ParseMetadata(ParserMetadataError),
+    SymbolTable(String, fsst::Error),
     UnsupportedFeature(String),
     Validation(&'static str),
     Io(std::io::Error),
@@ -56,6 +57,7 @@ impl fmt::Display for Error {
             ErrorInner::Io(err) => write!(f, "input/outpur error: {err}"),
             ErrorInner::ParseMetadata(err) => write!(f, "failed to parse metadata: {err}"),
             ErrorInner::Validation(err) => write!(f, "malformed metadata: {err}"),
+            ErrorInner::SymbolTable(msg, err) => write!(f, "{msg}: {err}"),
             ErrorInner::UnsupportedFeature(msg) => write!(f, "unsupported feature: {msg}"),
         }
     }
@@ -67,6 +69,7 @@ impl std::error::Error for Error {
             ErrorInner::Section(_, Some(err)) => Some(err),
             ErrorInner::Io(err) => Some(err),
             ErrorInner::ParseMetadata(err) => Some(err),
+            ErrorInner::SymbolTable(_, err) => Some(err),
             _ => None,
         }
     }
@@ -103,6 +106,15 @@ impl<T> ResultExt<T> for Result<T, section::Error> {
         match self {
             Ok(v) => Ok(v),
             Err(err) => Err(ErrorInner::Section(msg.to_string(), Some(err)).into()),
+        }
+    }
+}
+impl<T> ResultExt<T> for Result<T, fsst::Error> {
+    #[inline]
+    fn context(self, msg: impl fmt::Display) -> Result<T> {
+        match self {
+            Ok(v) => Ok(v),
+            Err(err) => Err(ErrorInner::SymbolTable(msg.to_string(), err).into()),
         }
     }
 }
@@ -562,7 +574,7 @@ impl ArchiveIndex {
                 }
             }
             if let Some(symtab_bytes) = &tbl.symtab {
-                let decoder = FsstDecoder::parse_symtab(symtab_bytes).context(msg_symtab)?;
+                let symtab = fsst::Decoder::parse(symtab_bytes).context(msg_symtab)?;
                 let encoded = &tbl.buffer[..];
                 // The decoded length must be greater than encoded length to
                 // worth it, so 1x is not enough. Pick 2x as the least bound here.
@@ -575,10 +587,10 @@ impl ArchiveIndex {
                     let sym = encoded
                         .get(w[0] as usize..w[1] as usize)
                         .context(msg_index)?;
-                    let sym_dec_len = FsstDecoder::max_decode_len(sym.len());
+                    let sym_dec_len = fsst::Decoder::max_decode_len(sym.len());
                     out_buf.resize(out_len + sym_dec_len, 0);
                     let sym_out = &mut out_buf[out_len..out_len + sym_dec_len];
-                    let len = decoder.decode_into(sym, sym_out).context(msg_decode)?;
+                    let len = symtab.decode_into(sym, sym_out).context(msg_decode)?;
                     // Each decoded symbol must be in UTF-8.
                     str::from_utf8(&sym_out[..len]).ok().context(msg_decode)?;
                     out_len += len;
@@ -902,7 +914,7 @@ impl<R: ReadAt + ?Sized> Archive<R> {
             buf.truncate(len);
             self.cache.push(section_idx, buf);
 
-            Ok(())
+            Ok::<_, section::Error>(())
         })()
         .context(format_args!("failed to read block {section_idx}"))
     }
