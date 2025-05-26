@@ -1,9 +1,4 @@
-use std::{
-    fs::File,
-    io::Write,
-    process::{Command, Stdio},
-    time::Instant,
-};
+use std::{fs::File, io::Write, time::Instant};
 
 use dwarfs::{
     Archive,
@@ -11,6 +6,7 @@ use dwarfs::{
     metadata::Schema,
     section::{SectionReader, SectionType},
 };
+use xshell::{Shell, cmd};
 
 mod check_content;
 mod mtree;
@@ -55,6 +51,7 @@ enum Cli {
 fn main() {
     let cli = <Cli as clap::Parser>::parse();
     env_logger::init();
+    let sh = Shell::new().unwrap();
 
     match &cli {
         Cli::SchemaRoundtrip { input, .. } => {
@@ -97,20 +94,9 @@ fn main() {
                     .write_all(got.as_bytes())
                     .expect("failed to write to stdout"),
                 _ => {
-                    let out = Command::new("dwarfsextract")
-                        .args(["-i", input, "-f", "mtree"])
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::inherit())
-                        .output()
-                        .expect("failed to run dwarfsextract");
-                    assert!(
-                        out.status.success(),
-                        "dwarfsextract exited with an error {}",
-                        out.status
-                    );
-                    let expect = String::from_utf8(out.stdout)
-                        .expect("dwarfsextract returns a non-UTF8 output");
+                    let expect = cmd!(sh, "dwarfsextract -i {input} -f mtree")
+                        .read()
+                        .expect("failed to run 'dwarfsextract'");
 
                     if expect == got {
                         println!("OK");
@@ -159,15 +145,9 @@ fn main() {
                 eprintln!("extracting into temp dir: {}", tmp_path.display());
 
                 let inst = Instant::now();
-                let st = Command::new("dwarfsextract")
-                    .args(["-i", input, "-o"])
-                    .arg(tmp_path)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .expect("failed to run dwarfsextract");
-                assert!(st.success(), "dwarfsextract exited with an error {st}");
+                cmd!(sh, "dwarfsextract -i {input} -o {tmp_path}")
+                    .run()
+                    .expect("failed to run 'dwarfsextract'");
                 eprintln!("extracted in {:?}", inst.elapsed());
             }
             let check_path = tmp_dir.as_ref().map(|p| {
