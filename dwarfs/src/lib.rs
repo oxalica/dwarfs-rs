@@ -51,9 +51,10 @@
 //!   [`log` crate][log]. Useful for profiling or debugging. Should not
 //!   have performance penalty unless trace-level log is enabled.
 //!
-//! - `serialize` *(Enabled by default)*
+//! - `serialize` *(Disabled by default)*
 //!
-//!   Enable serialization support for [`metadata::Schema`].
+//!   Enable serialization support for various structures. Currently, it only
+//!   includes [`metadata::Schema::to_bytes`].
 //!
 //! [log]: https://crates.io/crates/log
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]

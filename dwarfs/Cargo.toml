@@ -9,7 +9,7 @@ categories = ["compression", "filesystem"]
 repository = "https://github.com/oxalica/dwarfs-rs"
 
 [features]
-default = ["zstd", "log", "serialize"]
+default = ["zstd", "log"]
 
 # Compression algorithms support.
 zstd = ["dep:zstd"]
