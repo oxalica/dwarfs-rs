@@ -540,12 +540,20 @@ impl ArchiveIndex {
             if tbl.packed_index {
                 let mut sum = 0u32;
                 for v in &mut tbl.index {
+                    // NB. The packed value starts at the delta between the first two elements.
+                    // That is: [0, 3, 7] is packed into [3, 4], with one less element.
+                    // Thus during unpacking, the element should be updated to
+                    // the sum of all previous elements, excluding itself.
+                    let old = *v;
+                    *v = sum;
                     sum = sum
-                        .checked_add(*v)
+                        .checked_add(old)
                         .filter(|&i| i <= len)
                         .context(msg_index)?;
-                    *v = sum;
                 }
+                // Fix the omitted last element.
+                tbl.index.push(sum);
+
             // If symtab is used, the decoding process below will validate index ranges anyway.
             } else if tbl.symtab.is_none() {
                 tbl.index.is_sorted().or_context(msg_index)?;
