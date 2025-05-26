@@ -1,4 +1,8 @@
-use std::{fs::File, io::Write, time::Instant};
+use std::{
+    fs::{self, File},
+    io::Write,
+    time::Instant,
+};
 
 use dwarfs::{
     Archive,
@@ -13,6 +17,12 @@ mod mtree;
 
 #[derive(Debug, clap::Parser)]
 enum Cli {
+    #[cfg(unix)]
+    #[command(hide = true)]
+    GenPrivilegedArchive {
+        #[arg(long)]
+        output: String,
+    },
     /// Deserialize, serialize, re-deserialize the schema to verify it's the same result.
     SchemaRoundtrip {
         /// The input DwarFS archive path.
@@ -54,6 +64,43 @@ fn main() {
     let sh = Shell::new().unwrap();
 
     match &cli {
+        // Used by `../tests/tests/rs`.
+        #[cfg(unix)]
+        Cli::GenPrivilegedArchive { output } => {
+            use rustix::fs as ufs;
+
+            assert!(
+                rustix::process::geteuid().is_root(),
+                "gen-privileged-archive must be executed under root or 'fakeroot'",
+            );
+
+            let temp_dir = tempfile::tempdir().expect("failed to create tempdir");
+            let src_path = temp_dir.path().join("root");
+            std::fs::create_dir(&src_path).unwrap();
+            ufs::mknodat(
+                ufs::ABS,
+                src_path.join("bdev"),
+                ufs::FileType::BlockDevice,
+                ufs::Mode::from_bits_truncate(0o777),
+                0x0123_4567_89AB_CDEF,
+            )
+            .unwrap();
+            ufs::mknodat(
+                ufs::ABS,
+                src_path.join("cdev"),
+                ufs::FileType::CharacterDevice,
+                ufs::Mode::from_bits_truncate(0o777),
+                0xFEDC_BA98_7654_3210,
+            )
+            .unwrap();
+
+            cmd!(
+                sh,
+                "mkdwarfs -i {src_path} -o {output} --no-progress --log-level=error --with-devices"
+            )
+            .run()
+            .expect("failed to run 'mkdwarfs'");
+        }
         Cli::SchemaRoundtrip { input, .. } => {
             let file = File::open(input).expect("failed to open input file");
             let file_size = file.metadata().expect("failed to get file size").len();
@@ -88,7 +135,7 @@ fn main() {
             mtree::dump(&mut got, &index).expect("failed to dump mtree");
             let got = String::from_utf8(got).expect("output must be UTF8");
             match output {
-                Some(path) => std::fs::write(path, &got).expect("failed to write file"),
+                Some(path) => fs::write(path, &got).expect("failed to write file"),
                 None if !*check => std::io::stdout()
                     .lock()
                     .write_all(got.as_bytes())
@@ -131,7 +178,7 @@ fn main() {
                     tmp_dir = Some({
                         use std::os::unix::fs::PermissionsExt;
                         tempfile::Builder::new()
-                            .permissions(std::fs::Permissions::from_mode(0o700))
+                            .permissions(fs::Permissions::from_mode(0o700))
                             .tempdir()
                             .expect("failed to create tempdir")
                     });
