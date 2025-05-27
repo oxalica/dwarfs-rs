@@ -1,3 +1,4 @@
+//! Basic functionality tests.
 use std::{
     fs,
     io::BufRead,
@@ -238,12 +239,9 @@ fn unix_devices() {
 
     let (sh, _temp_dir) = new_temp_shell();
     let exe = env!("CARGO_BIN_EXE_dwarfs-test");
-    cmd!(
-        sh,
-        "fakeroot -- {exe} gen-privileged-archive --output img.dwarfs"
-    )
-    .run()
-    .unwrap();
+    cmd!(sh, "fakeroot -- {exe} gen-privileged-archive img.dwarfs")
+        .run()
+        .unwrap();
     let archive_path = sh.current_dir().join("img.dwarfs");
     debug_print_mtree(&sh, &archive_path);
 

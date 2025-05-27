@@ -6,8 +6,6 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-clap = { version = "4.5.38", features = ["derive"] }
-colored-diff = "0.2.3"
 dwarfs = { path = "../dwarfs", features = ["serialize"] }
 env_logger = "0.11.8"
 tempfile = "3.20.0"
@@ -16,3 +14,7 @@ xshell = "0.2.7"
 [target.'cfg(unix)'.dependencies]
 # use-libc is necessary to support fakeroot.
 rustix = { version = "1.0.7", features = ["fs", "process", "use-libc"] }
+
+[dev-dependencies]
+hex = "0.4.3"
+sha2 = "0.10.9"
