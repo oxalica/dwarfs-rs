@@ -83,7 +83,7 @@ fn de_frozen() {
         file_version: 1,
     };
 
-    let de = super::de_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
+    let de = de_frozen::deserialize::<Pair>(&schema, b"\x42\0\0\0\0\0\0\0").unwrap();
     assert_eq!(
         de,
         Pair {

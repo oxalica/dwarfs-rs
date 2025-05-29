@@ -25,6 +25,8 @@ mod de_frozen;
 mod de_thrift;
 
 #[cfg(feature = "serialize")]
+mod ser_frozen;
+#[cfg(feature = "serialize")]
 mod ser_thrift;
 
 #[cfg(test)]
@@ -45,7 +47,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A dense map of i16 -> T, stored as `Vec<Option<T>>` for quick indexing.
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Default, Clone, PartialEq, Eq, Hash)]
 pub struct DenseMap<T>(pub Vec<Option<T>>);
 
 impl<T: fmt::Debug> fmt::Debug for DenseMap<T> {
@@ -154,7 +156,7 @@ pub struct Schema {
 ///
 /// See [module level documentation][self] for details.
 #[expect(missing_docs, reason = "users should check upstream docs")]
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaLayout {
     // NB. Field order matters for ser/de impl.
@@ -174,7 +176,7 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 ///
 /// See [module level documentation][self] for details.
 #[expect(missing_docs, reason = "users should check upstream docs")]
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct SchemaField {
     // NB. Field order matters for ser/de impl.
@@ -211,13 +213,17 @@ impl Schema {
 
     /// Serialize the schema to on-disk bytes, does the reverse of [`Schema::parse`].
     ///
-    /// Note that the serialization format is not canonical, so
-    /// `Schema::parse(bytes)?.to_bytes() == bytes` may NOT hold.
-    /// However, this function alone is reproducible and the result is
-    /// revertible, that means:
+    /// The serialization format is not canonical and the result may change
+    /// between versions of this library. It is not considered a breaking
+    /// change but a minor change.
+    ///
+    /// # Properties
     ///
     /// - If `schema1 == schema2`, then `schema1.to_bytes()? == schema2.to_bytes()?`
+    ///
     /// - `Schema::parse(schema.to_bytes()?)? == schema`
+    ///
+    /// - `Schema::parse(bytes)?.to_bytes() == bytes` may *NOT* hold.
     ///
     /// # Errors
     ///
@@ -426,6 +432,28 @@ impl Metadata {
     pub fn parse(schema: &Schema, bytes: &[u8]) -> Result<Self> {
         de_frozen::deserialize(schema, bytes)
             .map_err(|err| Error(format!("failed to parse metadata: {err}").into()))
+    }
+
+    /// Serialize the metadata to on-disk bytes, does the reverse of [`Metadata::parse`].
+    ///
+    /// The serialization format is not canonical and the result may change
+    /// between versions of this library. It is not considered a breaking
+    /// change but a minor change.
+    ///
+    /// # Properties
+    ///
+    /// - If `meta1 == meta2`, then `meta1.to_schema_and_bytes()? == meta2.to_schema_and_bytesto_bytes()?`
+    ///
+    /// - `let (schema, bytes) = meta.to_schema_and_bytes()?; meta == Metadata::parse(&schema, &bytes)?`
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if serialization fails. Currently this can happen on
+    /// overly large collections whose length exceeds `i32::MAX`.
+    #[cfg(feature = "serialize")]
+    pub fn to_schema_and_bytes(&self) -> Result<(Schema, Vec<u8>)> {
+        ser_frozen::serialize_struct(self)
+            .map_err(|err| Error(format!("failed to serialize metadata: {err}").into()))
     }
 }
 

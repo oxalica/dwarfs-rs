@@ -3,8 +3,9 @@ use std::{io::BufRead, sync::LazyLock, time::Instant};
 
 use dwarfs::{
     Archive, AsChunks,
-    metadata::Schema,
-    section::{SectionReader, SectionType},
+    metadata::{Metadata, Schema},
+    positioned_io::ReadAt,
+    section::{SectionIndexEntry, SectionReader, SectionType},
 };
 use xshell::{Shell, cmd};
 
@@ -24,6 +25,21 @@ fn with_tests(mut f: impl FnMut(&str, std::fs::File)) {
     }
 }
 
+fn read_section_by_type(
+    rdr: &mut SectionReader<impl ReadAt>,
+    sec_index: &[SectionIndexEntry],
+    typ: SectionType,
+) -> Vec<u8> {
+    let offset = sec_index
+        .iter()
+        .find_map(|i| (i.section_type() == typ).then_some(i.offset()))
+        .expect("missing section");
+    let (_, bytes) = rdr
+        .read_section_at(offset, 16 << 20)
+        .expect("failed to read section");
+    bytes
+}
+
 #[test]
 #[ignore = "large test"]
 fn schema_roundtrip() {
@@ -34,20 +50,36 @@ fn schema_roundtrip() {
             .read_section_index(file_size, 16 << 20)
             .expect("failed to read section index")
             .expect("missing section index");
-        let offset = sec_index
-            .iter()
-            .find_map(|i| {
-                (i.section_type() == SectionType::METADATA_V2_SCHEMA).then_some(i.offset())
-            })
-            .expect("missing schema section");
-        let (_, schema_bytes) = rdr
-            .read_section_at(offset, 16 << 20)
-            .expect("failed to read schema");
+        let schema_bytes =
+            read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2_SCHEMA);
 
         let schema1 = Schema::parse(&schema_bytes).expect("failed to parse schema");
-        let schema_ser = schema1.to_bytes().expect("failed to serialize schema");
-        let schema2 = Schema::parse(&schema_ser).expect("failed to reparse schema");
+        let schema_ser = schema1.to_bytes().unwrap();
+        let schema2 = Schema::parse(&schema_ser).unwrap();
         assert_eq!(schema1, schema2);
+    });
+}
+
+#[test]
+#[ignore = "largetest"]
+fn metadata_roundtrip() {
+    with_tests(|_path, file| {
+        let file_size = file.metadata().expect("failed to get file size").len();
+        let mut rdr = SectionReader::new(file);
+        let (_, sec_index) = rdr
+            .read_section_index(file_size, 16 << 20)
+            .expect("failed to read section index")
+            .expect("missing section index");
+        let schema_bytes =
+            read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2_SCHEMA);
+        let schema = Schema::parse(&schema_bytes).expect("failed to parse schema");
+        let metadata_bytes = read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2);
+        let metadata1 =
+            Metadata::parse(&schema, &metadata_bytes).expect("failed to parse metadata");
+
+        let (schema_ser, metadata_ser) = metadata1.to_schema_and_bytes().unwrap();
+        let metadata2 = Metadata::parse(&schema_ser, &metadata_ser).unwrap();
+        assert_eq!(metadata1, metadata2);
     });
 }
 

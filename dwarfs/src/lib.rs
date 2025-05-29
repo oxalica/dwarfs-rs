@@ -55,6 +55,7 @@
 //!
 //!   Enable serialization support for various structures. It enables:
 //!   - [`metadata::Schema::to_bytes`]
+//!   - [`metadata::Metadata::to_schema_and_bytes`]
 //!   - [`fsst::to_bytes`]
 //!
 //! [log]: https://crates.io/crates/log
