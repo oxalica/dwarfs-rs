@@ -505,7 +505,7 @@ pub struct Metadata {
     pub features: Option<OrderedSet<BString>>,
     pub category_names: Option<Vec<BString>>,
     pub block_categories: Option<Vec<BString>>,
-    // pub reg_file_size_cache: Option<InodeSizeCache>,
+    pub reg_file_size_cache: Option<InodeSizeCache>,
 }
 
 /// See [module level documentation][self] for details.

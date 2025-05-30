@@ -120,21 +120,25 @@ struct Deserializer<'a, 'de> {
 }
 
 impl<'de> Deserializer<'_, 'de> {
-    fn field_deserializer(&self, i: i16) -> Option<Self> {
-        let field = self.layout?.fields.get(i)?;
-        Some(Self {
+    fn field_deserializer(&self, i: i16) -> Self {
+        let (layout, offset_bits) = if let Some(field) = self.layout.and_then(|l| l.fields.get(i)) {
+            (
+                self.src.schema.layouts.get(field.layout_id),
+                field.offset_bits(),
+            )
+        } else {
+            (None, 0)
+        };
+        Self {
             src: self.src,
-            layout: self.src.schema.layouts.get(field.layout_id),
-            bit_offset: self.bit_offset + Offset::from(field.offset_bits()),
+            layout,
+            bit_offset: self.bit_offset + Offset::from(offset_bits),
             storage_start: self.storage_start,
-        })
+        }
     }
 
-    fn deserialize_field<T: de::Deserialize<'de> + Default>(&self, i: i16) -> Result<T> {
-        match self.field_deserializer(i) {
-            Some(de) => de::Deserialize::deserialize(de),
-            None => Ok(T::default()),
-        }
+    fn deserialize_field<T: de::Deserialize<'de>>(&self, i: i16) -> Result<T> {
+        de::Deserialize::deserialize(self.field_deserializer(i))
     }
 }
 
@@ -229,7 +233,28 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, 'de> {
             let id = l.fields.get(3)?.layout_id;
             Some(self.src.schema.layouts.get(id).expect("validated"))
         });
-        visitor.visit_seq(SeqDeserializer {
+        visitor.visit_seq(CollectionDeserializer {
+            elem_de: Self {
+                src: self.src,
+                layout: elem_layout,
+                bit_offset: 0,
+                storage_start: self.storage_start + distance,
+            },
+            len,
+        })
+    }
+
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        let distance = self.deserialize_field::<u32>(1)?;
+        let len = self.deserialize_field::<u32>(2)?;
+        let elem_layout = self.layout.and_then(|l| {
+            let id = l.fields.get(3)?.layout_id;
+            Some(self.src.schema.layouts.get(id).expect("validated"))
+        });
+        visitor.visit_map(CollectionDeserializer {
             elem_de: Self {
                 src: self.src,
                 layout: elem_layout,
@@ -247,13 +272,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, 'de> {
         if !self.deserialize_field::<bool>(1)? {
             return visitor.visit_none();
         }
-        let de = self.field_deserializer(2).unwrap_or(Deserializer {
-            src: self.src,
-            layout: None,
-            bit_offset: self.bit_offset,
-            storage_start: self.storage_start,
-        });
-        visitor.visit_some(de)
+        visitor.visit_some(self.field_deserializer(2))
     }
 
     fn deserialize_struct<V>(
@@ -281,7 +300,7 @@ impl<'de> de::Deserializer<'de> for Deserializer<'_, 'de> {
     forward_to_deserialize_any! {
         i8 i16 i32 i64 i128 u8 u16 u128 f32 f64 char str string
         unit unit_struct newtype_struct tuple
-        tuple_struct map enum identifier
+        tuple_struct enum identifier
     }
 }
 
@@ -319,33 +338,17 @@ impl<'de> de::MapAccess<'de> for StructDeserializer<'_, 'de> {
     where
         V: de::DeserializeSeed<'de>,
     {
-        let field = self.de.layout.expect("checked").fields.0[self.field_id]
-            .as_ref()
-            .expect("checked");
-        let sublayout = self
-            .de
-            .src
-            .schema
-            .layouts
-            .get(field.layout_id)
-            .expect("validated");
-        let de = Deserializer {
-            src: self.de.src,
-            layout: Some(sublayout),
-            bit_offset: self.de.bit_offset + u32::from(field.offset_bits()),
-            storage_start: self.de.storage_start,
-        };
         self.field_id += 1;
-        seed.deserialize(de)
+        seed.deserialize(self.de.field_deserializer(self.field_id as i16 - 1))
     }
 }
 
-struct SeqDeserializer<'a, 'de> {
+struct CollectionDeserializer<'a, 'de> {
     elem_de: Deserializer<'a, 'de>,
     len: u32,
 }
 
-impl<'de> de::SeqAccess<'de> for SeqDeserializer<'_, 'de> {
+impl<'de> de::SeqAccess<'de> for CollectionDeserializer<'_, 'de> {
     type Error = Error;
 
     fn size_hint(&self) -> Option<usize> {
@@ -366,5 +369,37 @@ impl<'de> de::SeqAccess<'de> for SeqDeserializer<'_, 'de> {
             self.elem_de.bit_offset += layout.bits as Offset;
         }
         ret.map(Some)
+    }
+}
+
+impl<'de> de::MapAccess<'de> for CollectionDeserializer<'_, 'de> {
+    type Error = Error;
+
+    fn size_hint(&self) -> Option<usize> {
+        self.len.try_into().ok()
+    }
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
+    where
+        K: de::DeserializeSeed<'de>,
+    {
+        if self.len == 0 {
+            return Ok(None);
+        }
+        self.len -= 1;
+
+        seed.deserialize(self.elem_de.field_deserializer(1))
+            .map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
+    where
+        V: de::DeserializeSeed<'de>,
+    {
+        let ret = seed.deserialize(self.elem_de.field_deserializer(2));
+        if let Some(layout) = self.elem_de.layout {
+            self.elem_de.bit_offset += layout.bits as Offset;
+        }
+        ret
     }
 }
