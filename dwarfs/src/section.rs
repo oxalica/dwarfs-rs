@@ -232,6 +232,21 @@ impl Header {
         Ok(())
     }
 
+    /// Update `payload_size`, `fast_hash` and `slow_hash` in header for the specific `payload`.
+    ///
+    /// The `payload` should be raw data after compression, if any is used.
+    pub fn update_size_and_checksum(&mut self, payload: &[u8]) {
+        self.payload_size = u64::try_from(payload.len())
+            .expect("payload length overflows u64")
+            .into();
+        self.fast_hash = self
+            .calculate_fast_checksum(payload)
+            .expect("length matches");
+        self.slow_hash = self
+            .calculate_slow_checksum(payload)
+            .expect("length matches");
+    }
+
     /// Check if this section header has the expected section type.
     pub(crate) fn check_type(&self, expect: SectionType) -> Result<()> {
         if self.section_type != expect {
@@ -281,6 +296,13 @@ impl fmt::Debug for MagicVersion {
 impl MagicVersion {
     /// The expected magic.
     pub const MAGIC: [u8; 6] = *b"DWARFS";
+
+    /// The magic and latest supported version.
+    pub const LATEST: Self = Self {
+        magic: Self::MAGIC,
+        major: SUPPORTED_VERSION_RANGE.end().0,
+        minor: SUPPORTED_VERSION_RANGE.end().1,
+    };
 
     /// Validate if the magic and version is supported by this library.
     ///
