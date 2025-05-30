@@ -1,12 +1,17 @@
 //! Large tests on real production archives.
-use std::{io::BufRead, sync::LazyLock, time::Instant};
+use std::{
+    io::{BufRead, Seek, SeekFrom, Write},
+    sync::LazyLock,
+    time::Instant,
+};
 
 use dwarfs::{
     Archive, AsChunks,
     metadata::{Metadata, Schema},
     positioned_io::ReadAt,
-    section::{SectionIndexEntry, SectionReader, SectionType},
+    section::{CompressAlgo, Header, MagicVersion, SectionIndexEntry, SectionReader, SectionType},
 };
+use tempfile::NamedTempFile;
 use xshell::{Shell, cmd};
 
 static TEST_FILES: LazyLock<Vec<String>> = LazyLock::new(|| {
@@ -40,47 +45,121 @@ fn read_section_by_type(
     bytes
 }
 
-#[test]
-#[ignore = "large test"]
-fn schema_roundtrip() {
-    with_tests(|_path, file| {
+/// Update the schema and metadata section of an existing DwarFS archive.
+fn patch_schema_and_metadata(
+    mut orig_file: &std::fs::File,
+    index: &[SectionIndexEntry],
+    schema_bytes: &[u8],
+    metadata_bytes: &[u8],
+) -> NamedTempFile {
+    // For typical archives, all non-BLOCK sections are at the end, after all BLOCK sections.
+    let data_sections = index
+        .iter()
+        .position(|&ent| ent.section_type() != SectionType::BLOCK)
+        .unwrap();
+    assert!(
+        index[data_sections..]
+            .iter()
+            .all(|ent| ent.section_type() != SectionType::BLOCK)
+    );
+    let data_end_pos = index[data_sections].offset();
+
+    let mut patched_file = NamedTempFile::new().unwrap();
+    let fout = patched_file.as_file_mut();
+    std::io::copy(&mut orig_file, fout).unwrap();
+    fout.set_len(data_end_pos).unwrap();
+    fout.seek(SeekFrom::End(0)).unwrap();
+
+    for (i, typ, payload) in [
+        (0, SectionType::METADATA_V2_SCHEMA, schema_bytes),
+        (1, SectionType::METADATA_V2, metadata_bytes),
+    ] {
+        write_section(fout, data_sections as u32 + i, typ, payload).unwrap();
+    }
+
+    patched_file
+}
+
+fn write_section(
+    w: &mut dyn Write,
+    section_num: u32,
+    typ: SectionType,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    use dwarfs::zerocopy::IntoBytes;
+
+    let mut header = Header {
+        magic_version: MagicVersion::LATEST,
+        slow_hash: [0; 32],
+        fast_hash: [0; 8],
+        section_number: section_num.into(),
+        section_type: typ,
+        compress_algo: CompressAlgo::NONE,
+        payload_size: 0.into(),
+    };
+    header.update_size_and_checksum(payload);
+    w.write_all(header.as_bytes())?;
+    w.write_all(payload)
+}
+
+fn test_reserialize(schema_only: bool) {
+    let sh = Shell::new().unwrap();
+
+    with_tests(|orig_path, file| {
+        let dump1 = cmd!(sh, "dwarfsck -i {orig_path} -d metadata_full_dump")
+            .read()
+            .unwrap();
+
         let file_size = file.metadata().expect("failed to get file size").len();
         let mut rdr = SectionReader::new(file);
         let (_, sec_index) = rdr
             .read_section_index(file_size, 16 << 20)
             .expect("failed to read section index")
             .expect("missing section index");
-        let schema_bytes =
+        let mut schema_bytes =
             read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2_SCHEMA);
+        let mut metadata_bytes =
+            read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2);
+        let schema = Schema::parse(&schema_bytes).expect("failed to parse schema");
 
-        let schema1 = Schema::parse(&schema_bytes).expect("failed to parse schema");
-        let schema_ser = schema1.to_bytes().unwrap();
-        let schema2 = Schema::parse(&schema_ser).unwrap();
-        assert_eq!(schema1, schema2);
+        if schema_only {
+            let schema_ser = schema.to_bytes().unwrap();
+            let schema2 = Schema::parse(&schema_ser).unwrap();
+            assert_eq!(schema, schema2);
+            schema_bytes = schema_ser;
+        } else {
+            let metadata = Metadata::parse(&schema, &metadata_bytes).unwrap();
+            let (schema2, metadata_ser) = metadata.to_schema_and_bytes().unwrap();
+            let metadata2 = Metadata::parse(&schema2, &metadata_ser).unwrap();
+            assert_eq!(metadata, metadata2);
+            let schema_ser = schema2.to_bytes().unwrap();
+            (schema_bytes, metadata_bytes) = (schema_ser, metadata_ser);
+        }
+
+        let patched_file =
+            patch_schema_and_metadata(rdr.get_ref(), &sec_index, &schema_bytes, &metadata_bytes);
+        let patched_path = patched_file.path();
+        let dump2 = cmd!(sh, "dwarfsck -i {patched_path} -d metadata_full_dump")
+            .read()
+            .unwrap();
+        if dump1 != dump2 {
+            std::fs::write("./result-metadata-dump-before.txt", &dump1).unwrap();
+            std::fs::write("./result-metadata-dump-after.txt", &dump2).unwrap();
+            panic!("metadata dump differs, results saved to result-metadata-dump-*.txt");
+        }
     });
 }
 
 #[test]
-#[ignore = "largetest"]
-fn metadata_roundtrip() {
-    with_tests(|_path, file| {
-        let file_size = file.metadata().expect("failed to get file size").len();
-        let mut rdr = SectionReader::new(file);
-        let (_, sec_index) = rdr
-            .read_section_index(file_size, 16 << 20)
-            .expect("failed to read section index")
-            .expect("missing section index");
-        let schema_bytes =
-            read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2_SCHEMA);
-        let schema = Schema::parse(&schema_bytes).expect("failed to parse schema");
-        let metadata_bytes = read_section_by_type(&mut rdr, &sec_index, SectionType::METADATA_V2);
-        let metadata1 =
-            Metadata::parse(&schema, &metadata_bytes).expect("failed to parse metadata");
+#[ignore = "large test"]
+fn schema_roundtrip() {
+    test_reserialize(true);
+}
 
-        let (schema_ser, metadata_ser) = metadata1.to_schema_and_bytes().unwrap();
-        let metadata2 = Metadata::parse(&schema_ser, &metadata_ser).unwrap();
-        assert_eq!(metadata1, metadata2);
-    });
+#[test]
+#[ignore = "large test"]
+fn metadata_roundtrip() {
+    test_reserialize(false);
 }
 
 #[test]

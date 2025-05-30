@@ -33,11 +33,7 @@ pub(crate) fn serialize_struct<T: ser::Serialize>(value: &T) -> Result<(Schema, 
             return Err(ser::Error::custom("root struct must not be empty"));
         };
         let mut schema = Schema {
-            layouts: DenseMap(
-                std::iter::once(None)
-                    .chain(set.into_iter().map(Some))
-                    .collect(),
-            ),
+            layouts: DenseMap(set.into_iter().map(Some).collect()),
             relax_type_checks: true,
             root_layout: root_id,
             file_version: 1,
@@ -74,19 +70,21 @@ fn cvt_layout(layout: &Layout, set: &mut IndexSet<SchemaLayout>) -> Result<Optio
             .0
         }
         Layout::Struct { fields, .. } => {
+            // Field index starts at 1.
             let mut ret_fields = DenseMap(vec![None; 1 + fields.len()]);
             let mut offset = 0i16;
             for (field, idx) in fields.iter().zip(1..) {
                 if let Some(layout_id) = cvt_layout(field, set)? {
                     ret_fields.0[idx] = Some(SchemaField { layout_id, offset });
                     // Checked by `Layout::finish` not to overflow.
-                    offset += field.byte_size() as i16;
+                    // NB. numbers are negative for bit-offset.
+                    offset -= field.byte_size() as i16 * 8;
                 }
             }
             debug_assert_ne!(offset, 0, "empty structs are handled by `Layout::finish`");
             set.insert_full(SchemaLayout {
                 size: 0,
-                bits: offset * 8,
+                bits: -offset,
                 fields: ret_fields,
                 type_name: String::new(),
             })
@@ -94,9 +92,8 @@ fn cvt_layout(layout: &Layout, set: &mut IndexSet<SchemaLayout>) -> Result<Optio
         }
         Layout::Collection { .. } => unreachable!(),
     };
-    // Index in schema starts at 1.
-    let idx =
-        i16::try_from(1 + idx).map_err(|_| ser::Error::custom("layout count overflows i16"))?;
+    // Layout id starts at 0.
+    let idx = i16::try_from(idx).map_err(|_| ser::Error::custom("layout count overflows i16"))?;
     Ok(Some(idx))
 }
 
