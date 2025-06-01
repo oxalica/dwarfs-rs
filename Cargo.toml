@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["dwarfs", "dwarfs-test"]
+members = [
+    "dwarfs",
+    "dwarfs-test",
+    "dwarfs-enc",
+]
 
 [profile.bench]
 debug = "line-tables-only"

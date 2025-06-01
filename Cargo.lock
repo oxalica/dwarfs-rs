@@ -165,6 +165,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dwarfs-enc"
+version = "0.1.0"
+
+[[package]]
 name = "dwarfs-test"
 version = "0.0.0"
 dependencies = [
