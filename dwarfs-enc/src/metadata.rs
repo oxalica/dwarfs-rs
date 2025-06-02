@@ -255,7 +255,7 @@ impl Builder {
     ///
     /// Return `Err` on inode count or directory entry count overflows.
     #[inline]
-    pub fn put_dir_entry(
+    pub fn put_entry_dir(
         &mut self,
         parent: DirId,
         name: &str,
@@ -277,7 +277,7 @@ impl Builder {
     /// # Errors
     ///
     /// Return `Err` on inode count or directory entry count overflows.
-    pub fn put_entry(
+    pub fn put_entry_inode(
         &mut self,
         parent: DirId,
         name: &str,
@@ -569,21 +569,11 @@ struct DirEntry {
 }
 
 /// A chunk of data for a regular file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chunk {
-    section_idx: u32,
-    offset: u32,
-    size: u32,
-}
-
-impl Chunk {
-    pub fn new(section_idx: u32, offset: u32, size: u32) -> Self {
-        Self {
-            section_idx,
-            offset,
-            size,
-        }
-    }
+    pub section_idx: u32,
+    pub offset: u32,
+    pub size: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

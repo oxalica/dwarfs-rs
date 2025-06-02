@@ -6,9 +6,9 @@
 //! [dwarfs]: https://github.com/mhx/dwarfs
 mod error;
 
-pub mod archive;
+pub mod chunker;
 pub mod metadata;
-mod section;
+pub mod section;
 
 use self::error::ErrorInner;
 pub use self::error::{Error, Result};

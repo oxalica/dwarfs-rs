@@ -140,4 +140,19 @@ impl<W: Write> Writer<W> {
 
         Ok(size_of_val(&header) + compressed_payload.len())
     }
+
+    pub fn write_metadata_sections(&mut self, metadata: &dwarfs::metadata::Metadata) -> Result<()> {
+        let (schema, metadata_bytes) = metadata.to_schema_and_bytes()?;
+        let schema_bytes = schema.to_bytes()?;
+        self.write_section(
+            SectionType::METADATA_V2_SCHEMA,
+            CompressParam::None,
+            &schema_bytes,
+        )?;
+        self.write_section(
+            SectionType::METADATA_V2,
+            CompressParam::None,
+            &metadata_bytes,
+        )
+    }
 }
