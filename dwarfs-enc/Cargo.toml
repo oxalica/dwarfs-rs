@@ -5,3 +5,7 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
+dwarfs = { version = "0.2.0", path = "../dwarfs", features = ["serialize"] }
+indexmap = "2.9.0"
+rustix = { version = "1.0.7", features = ["fs"] }
+serde = "1.0.219"

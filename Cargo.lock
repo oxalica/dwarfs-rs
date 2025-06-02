@@ -167,6 +167,12 @@ dependencies = [
 [[package]]
 name = "dwarfs-enc"
 version = "0.1.0"
+dependencies = [
+ "dwarfs",
+ "indexmap",
+ "rustix",
+ "serde",
+]
 
 [[package]]
 name = "dwarfs-test"
