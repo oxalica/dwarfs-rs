@@ -11,3 +11,4 @@ indexmap = "2.9.0"
 rustix = { version = "1.0.7", features = ["fs"] }
 serde = "1.0.219"
 sha2 = "0.10.9"
+zstd = "0.13.3"

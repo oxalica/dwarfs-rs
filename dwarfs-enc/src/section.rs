@@ -10,6 +10,7 @@ use crate::{ErrorInner, Result};
 #[non_exhaustive]
 pub enum CompressParam {
     None,
+    Zstd(u8),
     // TODO
 }
 
@@ -112,8 +113,19 @@ impl<W: Write> Writer<W> {
         compression: CompressParam,
         payload: &[u8],
     ) -> Result<usize> {
-        let (compress_algo, compressed_payload) = match compression {
-            CompressParam::None => (CompressAlgo::NONE, payload),
+        let mut buf = Vec::new();
+        let (compress_algo, compressed_payload) = 'compressed: {
+            match compression {
+                CompressParam::None => {}
+                CompressParam::Zstd(lvl) => {
+                    buf.resize(payload.len(), 0);
+                    let ret = zstd::bulk::compress_to_buffer(payload, &mut buf, lvl.into());
+                    if let Some(compressed_len) = ret.ok().filter(|len| *len < payload.len()) {
+                        break 'compressed (CompressAlgo::ZSTD, &buf[..compressed_len]);
+                    }
+                }
+            }
+            (CompressAlgo::NONE, payload)
         };
         let compressed_size = u64::try_from(compressed_payload.len())
             .ok()
@@ -131,7 +143,7 @@ impl<W: Write> Writer<W> {
         };
 
         // TODO: Multi threading.
-        header.update_size_and_checksum(payload);
+        header.update_size_and_checksum(compressed_payload);
 
         // We could use `write_vectored` here.
         // WAIT: <https://github.com/rust-lang/rust/issues/70436>
@@ -141,18 +153,14 @@ impl<W: Write> Writer<W> {
         Ok(size_of_val(&header) + compressed_payload.len())
     }
 
-    pub fn write_metadata_sections(&mut self, metadata: &dwarfs::metadata::Metadata) -> Result<()> {
+    pub fn write_metadata_sections(
+        &mut self,
+        metadata: &dwarfs::metadata::Metadata,
+        compression: CompressParam,
+    ) -> Result<()> {
         let (schema, metadata_bytes) = metadata.to_schema_and_bytes()?;
         let schema_bytes = schema.to_bytes()?;
-        self.write_section(
-            SectionType::METADATA_V2_SCHEMA,
-            CompressParam::None,
-            &schema_bytes,
-        )?;
-        self.write_section(
-            SectionType::METADATA_V2,
-            CompressParam::None,
-            &metadata_bytes,
-        )
+        self.write_section(SectionType::METADATA_V2_SCHEMA, compression, &schema_bytes)?;
+        self.write_section(SectionType::METADATA_V2, compression, &metadata_bytes)
     }
 }
