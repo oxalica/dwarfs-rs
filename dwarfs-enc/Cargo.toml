@@ -6,6 +6,8 @@ license = "GPL-3.0-only"
 
 [dependencies]
 dwarfs = { version = "0.2.0", path = "../dwarfs", features = ["serialize"] }
+fastcdc = "3.2.1"
 indexmap = "2.9.0"
 rustix = { version = "1.0.7", features = ["fs"] }
 serde = "1.0.219"
+sha2 = "0.10.9"

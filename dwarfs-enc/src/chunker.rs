@@ -1,4 +1,7 @@
-use std::io::{Read, Write};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    io::{Read, Write},
+};
 
 use dwarfs::section::SectionType;
 
@@ -123,5 +126,103 @@ impl<W: Write> Chunker for ConcatChunker<W> {
     fn put_reader(&mut self, rdr: &mut dyn Read) -> Result<Chunks> {
         let seq = self.put_reader_inner(rdr)?;
         Ok(seq.to_chunks(self.buf.len() as u32).collect())
+    }
+}
+
+pub struct FastCdcChunker<W> {
+    inner: ConcatChunker<W>,
+    table: HashMap<u64, CdcChunk>,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+    deduplicated_bytes: u64,
+}
+
+struct CdcChunk {
+    sha256_suffix: [u8; 24],
+    start_section_idx: u32,
+    start_offset: u32,
+}
+
+impl<W> FastCdcChunker<W> {
+    pub fn new(inner: ConcatChunker<W>, min_size: u32, avg_size: u32, max_size: u32) -> Self {
+        FastCdcChunker {
+            inner,
+            table: HashMap::new(),
+            min_size,
+            avg_size,
+            max_size,
+            deduplicated_bytes: 0,
+        }
+    }
+
+    pub fn deduplicated_bytes(&self) -> u64 {
+        self.deduplicated_bytes
+    }
+
+    pub fn into_inner(self) -> ConcatChunker<W>
+    where
+        W: Write,
+    {
+        self.inner
+    }
+}
+
+impl<W: Write> Chunker for FastCdcChunker<W> {
+    fn put_reader(&mut self, rdr: &mut dyn Read) -> Result<Chunks> {
+        use fastcdc::v2020::{Error as CdcError, StreamCDC};
+        use sha2::Digest;
+
+        let block_size = self.inner.buf.len() as u32;
+
+        // FIXME: `fastcdc`'s API is too hard to be efficient. It is heavy to construct
+        // and does not support allocation-less chunking.
+        let cdc = StreamCDC::new(rdr, self.min_size, self.avg_size, self.max_size);
+        let mut chunks = Chunks::new();
+        for ret in cdc {
+            let chunk = match ret {
+                Ok(chunk) => chunk.data,
+                Err(CdcError::IoError(err)) => return Err(err.into()),
+                Err(_) => unreachable!(),
+            };
+
+            let hash = sha2::Sha512_256::new_with_prefix(&chunk).finalize();
+            let (&hash_prefix, hash_suffix) = hash.split_first_chunk::<8>().unwrap();
+            let seq = match self.table.entry(u64::from_ne_bytes(hash_prefix)) {
+                Entry::Vacant(ent) => {
+                    let seq = self.inner.put_reader_inner(&mut chunk.as_slice()).unwrap();
+                    ent.insert(CdcChunk {
+                        sha256_suffix: hash_suffix.try_into().unwrap(),
+                        start_section_idx: seq.start_section_idx,
+                        start_offset: seq.start_offset,
+                    });
+                    seq
+                }
+                Entry::Occupied(ent) if ent.get().sha256_suffix == hash_suffix => {
+                    self.deduplicated_bytes += chunk.len() as u64;
+                    SeqChunks {
+                        start_section_idx: ent.get().start_section_idx,
+                        start_offset: ent.get().start_offset,
+                        len: chunk.len() as u64,
+                    }
+                }
+                // Hash prefix collision.
+                Entry::Occupied(_) => self.inner.put_reader_inner(&mut chunk.as_slice()).unwrap(),
+            };
+
+            // Merge chunks if possible.
+            for c in seq.to_chunks(block_size) {
+                if let Some(p) = chunks
+                    .last_mut()
+                    .filter(|p| (p.section_idx, p.offset + p.size) == (c.section_idx, c.offset))
+                {
+                    p.size += c.size;
+                } else {
+                    chunks.push(c);
+                }
+            }
+        }
+
+        Ok(chunks)
     }
 }
