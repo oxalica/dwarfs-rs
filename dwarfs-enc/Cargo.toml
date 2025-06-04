@@ -5,10 +5,12 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
+crossbeam-channel = "0.5.15"
 dwarfs = { version = "0.2.0", path = "../dwarfs", features = ["serialize"] }
 fastcdc = "3.2.1"
 indexmap = "2.9.0"
 rustix = { version = "1.0.7", features = ["fs"] }
 serde = "1.0.219"
 sha2 = "0.10.9"
+zerocopy = { version = "0.8.25", features = ["derive", "std"] }
 zstd = "0.13.3"

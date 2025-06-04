@@ -1,8 +1,11 @@
 use std::io::Write;
+use std::num::NonZero;
 
 use dwarfs::section::{CompressAlgo, Header, MagicVersion, SectionIndexEntry, SectionType};
 use dwarfs::zerocopy::IntoBytes;
+use zerocopy::FromBytes;
 
+use crate::ordered_parallel::OrderedParallel;
 use crate::{ErrorInner, Result};
 
 /// The section compression parameter.
@@ -16,18 +19,47 @@ pub enum CompressParam {
 
 #[derive(Debug)]
 pub struct Writer<W: ?Sized> {
-    next_offset: u64,
-    index: Vec<SectionIndexEntry>,
+    workers: OrderedParallel<Vec<u8>>,
+    /// The total number of sections initiated, including ones that are not written yet.
+    initiated_section_count: u32,
+    index: IndexBuilder,
+
     w: W,
 }
 
+#[derive(Debug, Default)]
+struct IndexBuilder {
+    index: Vec<SectionIndexEntry>,
+    next_offset: u64,
+}
+
+impl IndexBuilder {
+    pub fn push(&mut self, typ: SectionType, sec_raw_len: usize) -> Result<()> {
+        let ent = SectionIndexEntry::new(typ, self.next_offset).expect("checked by last write");
+        self.next_offset = u64::try_from(sec_raw_len)
+            .ok()
+            .and_then(|l| l.checked_add(self.next_offset))
+            .filter(|&n| n < 1u64 << 48)
+            .ok_or(ErrorInner::Limit("archive size exceeds 2^48 bytes"))?;
+        self.index.push(ent);
+        Ok(())
+    }
+}
+
 impl<W> Writer<W> {
-    pub const fn new(w: W) -> Self {
-        Self {
-            next_offset: 0,
-            index: Vec::new(),
+    pub fn new(w: W) -> std::io::Result<Self> {
+        let thread_cnt = std::thread::available_parallelism()?;
+        Self::new_with_thread_cnt(w, thread_cnt)
+    }
+
+    pub fn new_with_thread_cnt(w: W, thread_cnt: NonZero<usize>) -> std::io::Result<Self> {
+        let workers = OrderedParallel::new("compressor", thread_cnt)?;
+        Ok(Self {
+            workers,
+            initiated_section_count: 0,
+            index: IndexBuilder::default(),
             w,
-        }
+        })
     }
 }
 
@@ -49,42 +81,46 @@ impl<W: ?Sized> Writer<W> {
 }
 
 impl<W: Write> Writer<W> {
+    /// Number of sections of initiated via `write_section`.
     #[must_use]
     pub fn section_count(&self) -> u32 {
-        // Checked by `push_section` not to overflow u32.
-        self.index.len() as u32
+        // Checked by `write_section` not to overflow u32.
+        self.initiated_section_count
     }
 
     pub fn finish(&mut self) -> Result<()> {
-        // This is the last section. The next offset is ignored. Put a zero here.
-        self.push_section(SectionType::SECTION_INDEX, 0)?;
-        let section_number = self.section_count();
-        Self::write_section_inner(
-            &mut self.w,
-            section_number,
+        // Wait for all proceeding sections to complete, so their offsets are recorded.
+        self.workers.stop();
+        while let Some(iter) = self.workers.wait_and_get() {
+            Self::commit_completed(iter, &mut self.w, &mut self.index)?;
+        }
+
+        // The last length is unused.
+        let index_byte_len = self.index.index.as_bytes().len() + size_of::<SectionIndexEntry>();
+        self.index
+            .push(SectionType::SECTION_INDEX, index_byte_len)?;
+        let sec = Self::seal_section(
+            self.section_count(),
             SectionType::SECTION_INDEX,
             CompressParam::None,
-            self.index.as_slice().as_bytes(),
-        )?;
-
-        // Set to an invalid state so there cannot be more sections.
-        std::mem::take(&mut self.index);
-        self.next_offset = u64::MAX;
+            self.index.index.as_bytes(),
+        );
+        self.w.write_all(&sec)?;
 
         Ok(())
     }
 
-    fn push_section(&mut self, typ: SectionType, written: usize) -> Result<()> {
-        let ent = SectionIndexEntry::new(typ, self.next_offset)
-            .ok_or(ErrorInner::Limit("archive size exceeds 2^48 bytes"))?;
-        self.index.push(ent);
-        // An overflow will be detected by next `push_section`.
-        self.next_offset = self
-            .next_offset
-            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
-        u32::try_from(self.index.len())
-            .ok()
-            .ok_or(ErrorInner::Limit("section count exceeds 2^32"))?;
+    fn commit_completed(
+        completed: impl Iterator<Item = Vec<u8>>,
+        w: &mut W,
+        index: &mut IndexBuilder,
+    ) -> Result<()> {
+        for sec in completed {
+            let off = std::mem::offset_of!(Header, section_type);
+            let typ = SectionType::read_from_prefix(&sec[off..]).unwrap().0;
+            w.write_all(&sec)?;
+            index.push(typ, sec.len())?;
+        }
         Ok(())
     }
 
@@ -94,43 +130,49 @@ impl<W: Write> Writer<W> {
         compression: CompressParam,
         payload: &[u8],
     ) -> Result<()> {
+        // Should not happen for current machines.
+        assert!(u64::try_from(size_of::<Header>() + payload.len()).is_ok());
+
         let section_number = self.section_count();
-        let written = Self::write_section_inner(
+        self.initiated_section_count = self
+            .initiated_section_count
+            .checked_add(1)
+            .ok_or(ErrorInner::Limit("section count exceeds 2^32"))?;
+
+        let payload = payload.to_vec();
+        Self::commit_completed(
+            self.workers.submit_and_get(move || {
+                Self::seal_section(section_number, section_type, compression, &payload)
+            }),
             &mut self.w,
-            section_number,
-            section_type,
-            compression,
-            payload,
-        )?;
-        self.push_section(section_type, written)?;
-        Ok(())
+            &mut self.index,
+        )
     }
 
-    fn write_section_inner(
-        w: &mut dyn Write,
+    /// Compress payload if possible, calculate hashes and fill the section header.
+    fn seal_section(
         section_number: u32,
         section_type: SectionType,
         compression: CompressParam,
         payload: &[u8],
-    ) -> Result<usize> {
-        let mut buf = Vec::new();
-        let (compress_algo, compressed_payload) = 'compressed: {
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; size_of::<Header>() + payload.len()];
+        let (compress_algo, compressed_len) = 'compressed: {
+            let compressed_buf = &mut buf[size_of::<Header>()..];
             match compression {
                 CompressParam::None => {}
                 CompressParam::Zstd(lvl) => {
-                    buf.resize(payload.len(), 0);
-                    let ret = zstd::bulk::compress_to_buffer(payload, &mut buf, lvl.into());
+                    let ret = zstd::bulk::compress_to_buffer(payload, compressed_buf, lvl.into());
                     if let Some(compressed_len) = ret.ok().filter(|len| *len < payload.len()) {
-                        break 'compressed (CompressAlgo::ZSTD, &buf[..compressed_len]);
+                        break 'compressed (CompressAlgo::ZSTD, compressed_len);
                     }
                 }
             }
-            (CompressAlgo::NONE, payload)
+            compressed_buf.copy_from_slice(payload);
+            (CompressAlgo::NONE, payload.len())
         };
-        let compressed_size = u64::try_from(compressed_payload.len())
-            .ok()
-            // Should not happen for current machines.
-            .ok_or(ErrorInner::Limit("payload size exceeds 2^64 bytes"))?;
+        buf.truncate(size_of::<Header>() + compressed_len);
+        let (header_buf, compressed_buf) = buf.split_at_mut(size_of::<Header>());
 
         let mut header = Header {
             magic_version: MagicVersion::LATEST,
@@ -139,18 +181,12 @@ impl<W: Write> Writer<W> {
             section_number: section_number.into(),
             section_type,
             compress_algo,
-            payload_size: compressed_size.into(),
+            payload_size: 0.into(),
         };
+        header.update_size_and_checksum(compressed_buf);
+        header_buf.copy_from_slice(header.as_bytes());
 
-        // TODO: Multi threading.
-        header.update_size_and_checksum(compressed_payload);
-
-        // We could use `write_vectored` here.
-        // WAIT: <https://github.com/rust-lang/rust/issues/70436>
-        w.write_all(header.as_bytes())?;
-        w.write_all(compressed_payload)?;
-
-        Ok(size_of_val(&header) + compressed_payload.len())
+        buf
     }
 
     pub fn write_metadata_sections(

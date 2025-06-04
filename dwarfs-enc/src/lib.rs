@@ -8,6 +8,7 @@ mod error;
 
 pub mod chunker;
 pub mod metadata;
+mod ordered_parallel;
 pub mod section;
 
 use self::error::ErrorInner;
