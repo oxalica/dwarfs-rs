@@ -13,7 +13,7 @@ default = ["zstd", "log"]
 
 # Compression algorithms support.
 zstd = ["dep:zstd-safe"]
-lzma = ["dep:xz2"]
+lzma = ["dep:liblzma"]
 lz4 = ["dep:lz4"]
 
 # Extra functionalities.
@@ -31,7 +31,7 @@ positioned-io = { version = "0.3.4", default-features = false }
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-xz2 = { version = "0.1.7", optional = true }
+liblzma = { version = "0.4.1", optional = true }
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
 zstd-safe = { version = "7.2.4", optional = true, default-features = false }
 

@@ -647,10 +647,10 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 reason = "will not overflow usize because all data is in memory"
             )]
             CompressAlgo::LZMA => (|| {
-                let mut stream = xz2::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
-                let st = stream.process(raw_buf, out, xz2::stream::Action::Run)?;
+                let mut stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, 0)?;
+                let st = stream.process(raw_buf, out, liblzma::stream::Action::Run)?;
                 if stream.total_in() as usize != raw_buf.len()
-                    || st != xz2::stream::Status::StreamEnd
+                    || st != liblzma::stream::Status::StreamEnd
                 {
                     bail!(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
