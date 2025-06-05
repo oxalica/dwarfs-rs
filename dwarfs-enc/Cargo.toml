@@ -13,4 +13,4 @@ rustix = { version = "1.0.7", features = ["fs"] }
 serde = "1.0.219"
 sha2 = "0.10.9"
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
-zstd = "0.13.3"
+zstd-safe = { version = "7.2.4", default-features = false }

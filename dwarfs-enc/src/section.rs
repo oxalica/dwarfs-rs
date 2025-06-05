@@ -161,10 +161,24 @@ impl<W: Write> Writer<W> {
             let compressed_buf = &mut buf[size_of::<Header>()..];
             match compression {
                 CompressParam::None => {}
+                #[expect(non_upper_case_globals, reason = "name from C")]
                 CompressParam::Zstd(lvl) => {
-                    let ret = zstd::bulk::compress_to_buffer(payload, compressed_buf, lvl.into());
-                    if let Some(compressed_len) = ret.ok().filter(|len| *len < payload.len()) {
-                        break 'compressed (CompressAlgo::ZSTD, compressed_len);
+                    // See: <https://github.com/gyscos/zstd-rs/issues/276>
+                    const ZSTD_error_dstSize_tooSmall: zstd_safe::ErrorCode = -70isize as usize;
+
+                    match zstd_safe::compress(compressed_buf, payload, lvl.into()) {
+                        Ok(compressed_len) => {
+                            assert!(compressed_len <= payload.len());
+                            break 'compressed (CompressAlgo::ZSTD, compressed_len);
+                        }
+                        Err(ZSTD_error_dstSize_tooSmall) => {}
+                        Err(code) => {
+                            panic!(
+                                "compression failed (code={}): {}",
+                                code,
+                                zstd_safe::get_error_name(code)
+                            );
+                        }
                     }
                 }
             }

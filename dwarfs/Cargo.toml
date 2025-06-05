@@ -12,7 +12,7 @@ repository = "https://github.com/oxalica/dwarfs-rs"
 default = ["zstd", "log"]
 
 # Compression algorithms support.
-zstd = ["dep:zstd"]
+zstd = ["dep:zstd-safe"]
 lzma = ["dep:xz2"]
 lz4 = ["dep:lz4"]
 
@@ -33,7 +33,7 @@ sha2 = "0.10.9"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 xz2 = { version = "0.1.7", optional = true }
 zerocopy = { version = "0.8.25", features = ["derive", "std"] }
-zstd = { version = "0.13.3", optional = true }
+zstd-safe = { version = "7.2.4", optional = true, default-features = false }
 
 [lints.clippy]
 dbg-macro = "warn"

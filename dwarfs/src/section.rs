@@ -636,11 +636,11 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 Ok(compressed_size)
             }
             #[cfg(feature = "zstd")]
-            CompressAlgo::ZSTD => {
-                let len = zstd::bulk::decompress_to_buffer(raw_buf, out)
-                    .map_err(ErrorInner::Decompress)?;
-                Ok(len)
-            }
+            CompressAlgo::ZSTD => zstd_safe::decompress(out, raw_buf).map_err(|code| {
+                let msg = zstd_safe::get_error_name(code);
+                ErrorInner::Decompress(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                    .into()
+            }),
             #[cfg(feature = "lzma")]
             #[expect(
                 clippy::cast_possible_truncation,
