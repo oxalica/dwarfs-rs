@@ -4,6 +4,8 @@ use std::{
 };
 
 use dwarfs::section::SectionType;
+use rustic_cdc::{Rabin64, RollingHash64};
+use sha2::{Digest, Sha512_256};
 
 use crate::{
     Result,
@@ -129,12 +131,16 @@ impl<W: Write> Chunker for ConcatChunker<W> {
     }
 }
 
-pub struct FastCdcChunker<W> {
+/// The deduplicating chunker using Content Defined Chunking (CDC).
+///
+/// The exact algorithm used may change. Currently it uses [rustic_cdc].
+pub struct CdcChunker<W> {
     inner: ConcatChunker<W>,
+    // TODO: This struct is too large.
+    rabin: Rabin64,
+    chunk_buf: Box<[u8]>,
+
     table: HashMap<u64, CdcChunk>,
-    min_size: u32,
-    avg_size: u32,
-    max_size: u32,
     deduplicated_bytes: u64,
 }
 
@@ -144,14 +150,20 @@ struct CdcChunk {
     start_offset: u32,
 }
 
-impl<W> FastCdcChunker<W> {
-    pub fn new(inner: ConcatChunker<W>, min_size: u32, avg_size: u32, max_size: u32) -> Self {
-        FastCdcChunker {
+impl<W> CdcChunker<W> {
+    const WINDOW_SIZE_BITS: u32 = 6;
+    const WINDOW_SIZE: usize = 1usize << Self::WINDOW_SIZE_BITS;
+    const CUT_MASK: u64 = (1u64 << 11) - 1;
+    const MIN_CHUNK_SIZE: usize = Self::WINDOW_SIZE;
+    const MAX_CHUNK_SIZE: usize = 64 << 10;
+
+    pub fn new(inner: ConcatChunker<W>) -> Self {
+        let rabin = Rabin64::new(Self::WINDOW_SIZE_BITS);
+        CdcChunker {
             inner,
+            rabin,
+            chunk_buf: vec![0u8; Self::MAX_CHUNK_SIZE].into_boxed_slice(),
             table: HashMap::new(),
-            min_size,
-            avg_size,
-            max_size,
             deduplicated_bytes: 0,
         }
     }
@@ -168,29 +180,17 @@ impl<W> FastCdcChunker<W> {
     }
 }
 
-impl<W: Write> Chunker for FastCdcChunker<W> {
+impl<W: Write> Chunker for CdcChunker<W> {
     fn put_reader(&mut self, rdr: &mut dyn Read) -> Result<Chunks> {
-        use fastcdc::v2020::{Error as CdcError, StreamCDC};
-        use sha2::Digest;
-
         let block_size = self.inner.buf.len() as u32;
 
-        // FIXME: `fastcdc`'s API is too hard to be efficient. It is heavy to construct
-        // and does not support allocation-less chunking.
-        let cdc = StreamCDC::new(rdr, self.min_size, self.avg_size, self.max_size);
         let mut chunks = Chunks::new();
-        for ret in cdc {
-            let chunk = match ret {
-                Ok(chunk) => chunk.data,
-                Err(CdcError::IoError(err)) => return Err(err.into()),
-                Err(_) => unreachable!(),
-            };
-
-            let hash = sha2::Sha512_256::new_with_prefix(&chunk).finalize();
+        let mut record_chunk = |chunk: &[u8]| {
+            let hash = Sha512_256::new_with_prefix(chunk).finalize();
             let (&hash_prefix, hash_suffix) = hash.split_first_chunk::<8>().unwrap();
             let seq = match self.table.entry(u64::from_ne_bytes(hash_prefix)) {
                 Entry::Vacant(ent) => {
-                    let seq = self.inner.put_reader_inner(&mut chunk.as_slice()).unwrap();
+                    let seq = self.inner.put_reader_inner(&mut { chunk }).unwrap();
                     ent.insert(CdcChunk {
                         sha256_suffix: hash_suffix.try_into().unwrap(),
                         start_section_idx: seq.start_section_idx,
@@ -207,7 +207,7 @@ impl<W: Write> Chunker for FastCdcChunker<W> {
                     }
                 }
                 // Hash prefix collision.
-                Entry::Occupied(_) => self.inner.put_reader_inner(&mut chunk.as_slice()).unwrap(),
+                Entry::Occupied(_) => self.inner.put_reader_inner(&mut { chunk }).unwrap(),
             };
 
             // Merge chunks if possible.
@@ -221,6 +221,47 @@ impl<W: Write> Chunker for FastCdcChunker<W> {
                     chunks.push(c);
                 }
             }
+        };
+
+        self.rabin.reset();
+
+        // |               chunk_buf                       |
+        // | ...chunk | chunk | partial chunk | garbage... |
+        //                    ^cut_pos        ^end_pos: the end of last read data
+        let mut cut_pos = 0usize;
+        let mut end_pos = 0usize;
+        loop {
+            match rdr.read(&mut self.chunk_buf[end_pos..]) {
+                Ok(0) => break,
+                Ok(n) => end_pos += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err.into()),
+            };
+
+            for (&b, pos) in self.chunk_buf[cut_pos..end_pos].iter().zip(cut_pos..) {
+                self.rabin.slide(b);
+                let len = pos - cut_pos;
+                // The `MIN_CHUNK_SIZE` guarantees the sliding window is always filled.
+                if len >= Self::MIN_CHUNK_SIZE && self.rabin.hash & Self::CUT_MASK == Self::CUT_MASK
+                    || len >= Self::MAX_CHUNK_SIZE
+                {
+                    let chunk = &self.chunk_buf[cut_pos..pos];
+                    cut_pos = pos;
+                    record_chunk(chunk);
+                }
+            }
+
+            // Shift-down the last partial chunk if we reached the end of buffer.
+            // For files smaller than `MAX_CHUNK_SIZE`, this path is never entered.
+            if end_pos >= self.chunk_buf.len() {
+                self.chunk_buf.copy_within(cut_pos.., 0);
+                end_pos -= cut_pos;
+                cut_pos = 0;
+            }
+        }
+
+        if cut_pos < end_pos {
+            record_chunk(&self.chunk_buf[cut_pos..end_pos]);
         }
 
         Ok(chunks)
