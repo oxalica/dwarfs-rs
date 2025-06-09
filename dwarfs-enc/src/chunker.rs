@@ -8,7 +8,7 @@ use rustic_cdc::{Rabin64, RollingHash64};
 use sha2::{Digest, Sha512_256};
 
 use crate::{
-    Result,
+    Error, Result,
     metadata::Chunk,
     section::{self, CompressParam},
 };
@@ -185,29 +185,33 @@ impl<W: Write> Chunker for CdcChunker<W> {
         let block_size = self.inner.buf.len() as u32;
 
         let mut chunks = Chunks::new();
-        let mut record_chunk = |chunk: &[u8]| {
-            let hash = Sha512_256::new_with_prefix(chunk).finalize();
-            let (&hash_prefix, hash_suffix) = hash.split_first_chunk::<8>().unwrap();
+        let mut record_chunk = |cdchunk: &[u8]| {
+            debug_assert_ne!(cdchunk.len(), 0);
+
+            let hash = Sha512_256::new_with_prefix(cdchunk).finalize();
+            let (&hash_prefix, hash_suffix) = hash.split_first_chunk::<8>().expect("hash is 32B");
+            let hash_suffix: [u8; 24] = hash_suffix.try_into().expect("hash is 32B");
+
             let seq = match self.table.entry(u64::from_ne_bytes(hash_prefix)) {
                 Entry::Vacant(ent) => {
-                    let seq = self.inner.put_reader_inner(&mut { chunk }).unwrap();
+                    let seq = self.inner.put_reader_inner(&mut { cdchunk })?;
                     ent.insert(CdcChunk {
-                        sha256_suffix: hash_suffix.try_into().unwrap(),
+                        sha256_suffix: hash_suffix,
                         start_section_idx: seq.start_section_idx,
                         start_offset: seq.start_offset,
                     });
                     seq
                 }
                 Entry::Occupied(ent) if ent.get().sha256_suffix == hash_suffix => {
-                    self.deduplicated_bytes += chunk.len() as u64;
+                    self.deduplicated_bytes += cdchunk.len() as u64;
                     SeqChunks {
                         start_section_idx: ent.get().start_section_idx,
                         start_offset: ent.get().start_offset,
-                        len: chunk.len() as u64,
+                        len: cdchunk.len() as u64,
                     }
                 }
                 // Hash prefix collision.
-                Entry::Occupied(_) => self.inner.put_reader_inner(&mut { chunk }).unwrap(),
+                Entry::Occupied(_) => self.inner.put_reader_inner(&mut { cdchunk })?,
             };
 
             // Merge chunks if possible.
@@ -221,39 +225,51 @@ impl<W: Write> Chunker for CdcChunker<W> {
                     chunks.push(c);
                 }
             }
+
+            Ok::<_, Error>(())
         };
 
         self.rabin.reset();
 
-        // |               chunk_buf                       |
-        // | ...chunk | chunk | partial chunk | garbage... |
-        //                    ^cut_pos        ^end_pos: the end of last read data
+        // |               chunk_buf                            |
+        // | ...chunk | chunk | partial chunk | next read | ... |
+        //                    ^cut_pos        ^end_pos
+        //                                     ~~~~~~~~~~~ read_len
         let mut cut_pos = 0usize;
         let mut end_pos = 0usize;
         loop {
-            match rdr.read(&mut self.chunk_buf[end_pos..]) {
+            assert_ne!(end_pos, self.chunk_buf.len());
+            let read_len = match rdr.read(&mut self.chunk_buf[end_pos..]) {
                 Ok(0) => break,
-                Ok(n) => end_pos += n,
+                Ok(n) => n,
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(err) => return Err(err.into()),
             };
 
-            for (&b, pos) in self.chunk_buf[cut_pos..end_pos].iter().zip(cut_pos..) {
+            for (&b, pos) in self.chunk_buf[end_pos..end_pos + read_len]
+                .iter()
+                .zip(end_pos..)
+            {
                 self.rabin.slide(b);
-                let len = pos - cut_pos;
+                // This is the length of the whole chunk, including previous partial data.
+                // NB. the current byte at `pos` is included, hereby `+1`.
+                let len = pos - cut_pos + 1;
+
                 // The `MIN_CHUNK_SIZE` guarantees the sliding window is always filled.
                 if len >= Self::MIN_CHUNK_SIZE && self.rabin.hash & Self::CUT_MASK == Self::CUT_MASK
                     || len >= Self::MAX_CHUNK_SIZE
                 {
-                    let chunk = &self.chunk_buf[cut_pos..pos];
+                    let cdchunk = &self.chunk_buf[cut_pos..pos];
                     cut_pos = pos;
-                    record_chunk(chunk);
+                    record_chunk(cdchunk)?;
                 }
             }
+            end_pos += read_len;
 
             // Shift-down the last partial chunk if we reached the end of buffer.
             // For files smaller than `MAX_CHUNK_SIZE`, this path is never entered.
             if end_pos >= self.chunk_buf.len() {
+                debug_assert_eq!(end_pos, self.chunk_buf.len());
                 self.chunk_buf.copy_within(cut_pos.., 0);
                 end_pos -= cut_pos;
                 cut_pos = 0;
@@ -261,7 +277,7 @@ impl<W: Write> Chunker for CdcChunker<W> {
         }
 
         if cut_pos < end_pos {
-            record_chunk(&self.chunk_buf[cut_pos..end_pos]);
+            record_chunk(&self.chunk_buf[cut_pos..end_pos])?;
         }
 
         Ok(chunks)
