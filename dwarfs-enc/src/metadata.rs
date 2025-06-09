@@ -18,6 +18,7 @@ use std::{
     borrow::Cow,
     hash::{Hash, Hasher},
     num::NonZero,
+    time::{Duration, SystemTime},
 };
 
 use dwarfs::metadata;
@@ -43,7 +44,7 @@ pub struct Config {
     block_size: NonZero<u32>,
     mtime_only: bool,
     time_resolution_sec: NonZero<u32>,
-    // TODO: source_date_epoch: Option<NonZero<u64>>,
+    source_date_epoch: u64,
     creator: Option<Cow<'static, str>>,
     created_timestamp: Option<u64>,
 }
@@ -54,6 +55,7 @@ impl Default for Config {
             block_size: NonZero::new(16 << 20).expect("not zero"),
             mtime_only: false,
             time_resolution_sec: NonZero::new(1).expect("not zero"),
+            source_date_epoch: u64::MAX,
             creator: Some(Cow::Borrowed(Self::DEFAULT_CREATOR_VERSION)),
             created_timestamp: None,
         }
@@ -107,6 +109,14 @@ impl Config {
         self
     }
 
+    /// Set the [`SOURCE_DATE_EPOCH`](https://reproducible-builds.org/specs/source-date-epoch/)
+    /// which clamps all timestamps after it to it.
+    pub fn source_date_epoch(&mut self, timestamp: u64) -> &mut Self {
+        self.source_date_epoch = timestamp;
+        self.clamp_timestamp();
+        self
+    }
+
     /// Set a custom string indicating the name and version of the creator program.
     ///
     /// Default value is
@@ -118,10 +128,19 @@ impl Config {
 
     /// Set a timestamp indicating the archive creation time.
     ///
+    /// The value will be clamped by [`Config::source_date_epoch`] if both are set.
+    ///
     /// Default value is `None`.
     pub fn created_timestamp(&mut self, ts: impl Into<Option<u64>>) -> &mut Self {
         self.created_timestamp = ts.into();
+        self.clamp_timestamp();
         self
+    }
+
+    fn clamp_timestamp(&mut self) {
+        if let Some(t) = &mut self.created_timestamp {
+            *t = self.source_date_epoch.min(*t);
+        }
     }
 }
 
@@ -196,8 +215,14 @@ impl Builder {
             .ok()
             .ok_or(ErrorInner::Limit("inode count exceeds 2^32"))?;
 
-        let cvt_time = |timestamp: u64| {
-            u32::try_from(timestamp / u64::from(self.config.time_resolution_sec.get()))
+        let cvt_time = |time: SystemTime| {
+            let timestamp = time
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(|_| ErrorInner::Limit("timestamp before UNIX epoch is unsupported"))?
+                .as_secs();
+            let multiples = timestamp.min(self.config.source_date_epoch)
+                / u64::from(self.config.time_resolution_sec.get());
+            u32::try_from(multiples)
                 .map_err(|_| Error::from(ErrorInner::Limit("relative timestamp exceeds 2^32")))
         };
         let mtime_offset = cvt_time(meta.mtime)?;
@@ -655,9 +680,9 @@ pub struct InodeMetadata {
     mode_without_type: u32,
     uid: u32,
     gid: u32,
-    mtime: u64,
-    atime: u64,
-    ctime: u64,
+    mtime: SystemTime,
+    atime: SystemTime,
+    ctime: SystemTime,
 }
 
 impl TryFrom<&std::fs::Metadata> for InodeMetadata {
@@ -665,29 +690,33 @@ impl TryFrom<&std::fs::Metadata> for InodeMetadata {
 
     fn try_from(meta: &std::fs::Metadata) -> Result<Self, Self::Error> {
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt;
 
-            let cvt_time = |sec: i64| {
-                u64::try_from(sec)
-                    .ok()
-                    .ok_or(ErrorInner::Limit("negative timestamps are not supported"))
-            };
-
-            let mut ret = InodeMetadata::new(meta.mode() & 0o777);
-            ret.mtime(cvt_time(meta.mtime())?)
-                .atime(cvt_time(meta.atime())?)
-                .ctime(cvt_time(meta.ctime())?)
-                .uid(meta.uid())
-                .gid(meta.gid());
-            Ok(ret)
-        }
-
+        #[cfg(unix)]
+        let mode = meta.mode() & 0o777;
         #[cfg(not(unix))]
-        {
-            compile_error!("TODO: Only *NIX platforms are supported yet");
-            unimplemented!()
+        let mode = if meta.is_dir() { 0o755 } else { 0o644 };
+
+        let mut ret = InodeMetadata::new(mode);
+        if let Ok(mtime) = meta.modified() {
+            ret.mtime(mtime);
         }
+        if let Ok(atime) = meta.accessed() {
+            ret.atime(atime);
+        }
+
+        #[cfg(unix)]
+        {
+            let ctime = meta.ctime();
+            let ctime = if ctime >= 0 {
+                SystemTime::UNIX_EPOCH + Duration::from_secs(meta.ctime() as u64)
+            } else {
+                SystemTime::UNIX_EPOCH - Duration::from_secs(-meta.ctime() as u64)
+            };
+            ret.ctime(ctime).uid(meta.uid()).gid(meta.gid());
+        }
+
+        Ok(ret)
     }
 }
 
@@ -704,15 +733,15 @@ impl InodeMetadata {
             mode_without_type,
             uid: 0,
             gid: 0,
-            mtime: 0,
-            atime: 0,
-            ctime: 0,
+            mtime: SystemTime::UNIX_EPOCH,
+            atime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
         }
     }
 
     /// Set the owner numeric id.
     ///
-    /// If unset, it defaults to `0`.
+    /// If unset, it defaults to `0` (root).
     pub fn uid(&mut self, uid: u32) -> &mut Self {
         self.uid = uid;
         self
@@ -720,7 +749,7 @@ impl InodeMetadata {
 
     /// Set the owner group numeric id.
     ///
-    /// If unset, it defaults to `0`.
+    /// If unset, it defaults to `0` (root).
     pub fn gid(&mut self, gid: u32) -> &mut Self {
         self.gid = gid;
         self
@@ -728,26 +757,26 @@ impl InodeMetadata {
 
     /// Set the modification time (mtime).
     ///
-    /// If unset, it defaults to `0`.
-    pub fn mtime(&mut self, timestamp: u64) -> &mut Self {
+    /// If unset, it defaults to [`SystemTime::UNIX_EPOCH`].
+    pub fn mtime(&mut self, timestamp: SystemTime) -> &mut Self {
         self.mtime = timestamp;
         self
     }
 
     /// Set the access time (atime).
     ///
-    /// If unset, it defaults to `0`.
+    /// If unset, it defaults to [`SystemTime::UNIX_EPOCH`].
     /// If [`Config::mtime_only`] is set, this value is ignored.
-    pub fn atime(&mut self, timestamp: u64) -> &mut Self {
+    pub fn atime(&mut self, timestamp: SystemTime) -> &mut Self {
         self.atime = timestamp;
         self
     }
 
     /// Set the change time (ctime).
     ///
-    /// If unset, it defaults to `0`.
+    /// If unset, it defaults to [`SystemTime::UNIX_EPOCH`].
     /// If [`Config::mtime_only`] is set, this value is ignored.
-    pub fn ctime(&mut self, timestamp: u64) -> &mut Self {
+    pub fn ctime(&mut self, timestamp: SystemTime) -> &mut Self {
         self.ctime = timestamp;
         self
     }
