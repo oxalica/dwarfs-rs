@@ -1,8 +1,9 @@
 # dwarfs
 
-[![crates.io](https://img.shields.io/crates/v/dwarfs?label=dwarfs
-)](https://crates.io/crates/dwarfs)
+[![crates.io](https://img.shields.io/crates/v/dwarfs?label=dwarfs)](https://crates.io/crates/dwarfs)
 [![docs.rs](https://img.shields.io/docsrs/dwarfs?label=docs.rs%2Fdwarfs)](https://docs.rs/dwarfs)
+[![crates.io](https://img.shields.io/crates/v/dwarfs-enc?label=dwarfs-enc)](https://crates.io/crates/dwarfs-enc)
+[![docs.rs](https://img.shields.io/docsrs/dwarfs-enc?label=docs.rs%2Fdwarfs-enc)](https://docs.rs/dwarfs-enc)
 
 Libraries for reading and writing [DwarFS][dwarfs] archives (aka. DwarFS images),
 in pure Rust without `unsafe`.

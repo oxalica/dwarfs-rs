@@ -1,5 +1,8 @@
 # dwarfs-enc
 
+[![crates.io](https://img.shields.io/crates/v/dwarfs-enc)](https://crates.io/crates/dwarfs-enc)
+[![docs.rs](https://img.shields.io/docsrs/dwarfs-enc)](https://docs.rs/dwarfs-enc)
+
 A library for writing [DwarFS][dwarfs] archives (aka. DwarFS images),
 building on top of [`dwarfs` crate][dwarfs-rs].
 
