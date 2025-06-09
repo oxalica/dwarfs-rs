@@ -5,11 +5,13 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Error(Box<ErrorInner>);
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "default"), allow(dead_code))]
 pub(crate) enum ErrorInner {
     Limit(&'static str),
     SerializeMetadata(dwarfs::metadata::Error),
     DuplicatedEntry,
     UnlinkedInode,
+    Compress(std::io::Error),
 
     Io(std::io::Error),
 }
@@ -27,7 +29,7 @@ impl fmt::Display for Error {
             ErrorInner::Limit(msg) => write!(f, "{msg}"),
             ErrorInner::SerializeMetadata(err) => err.fmt(f),
             ErrorInner::UnlinkedInode => f.pad("an inode is unreachable from root"),
-            ErrorInner::Io(err) => err.fmt(f),
+            ErrorInner::Compress(err) | ErrorInner::Io(err) => err.fmt(f),
         }
     }
 }
@@ -35,7 +37,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &*self.0 {
-            ErrorInner::Io(err) => Some(err),
+            ErrorInner::Compress(err) | ErrorInner::Io(err) => Some(err),
             ErrorInner::SerializeMetadata(err) => Some(err),
             _ => None,
         }

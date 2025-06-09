@@ -22,8 +22,10 @@ struct Cli {
     #[arg(short, long)]
     force: bool,
 
-    #[arg(long, short = 'l', default_value_t = 22)]
-    compress_level: i32,
+    #[arg(long, conflicts_with = "lzma")]
+    zstd: Option<i32>,
+    #[arg(long)]
+    lzma: Option<u32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,12 +51,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stat
     };
 
-    let compress = if cli.compress_level == 0 {
-        CompressParam::None
-    } else {
-        CompressParam::Zstd(cli.compress_level)
+    let compress = match (cli.zstd, cli.lzma) {
+        (None, None) => CompressParam::None,
+        (Some(zstd), None) => CompressParam::Zstd(zstd),
+        (None, Some(lzma)) => CompressParam::Lzma(lzma),
+        _ => unreachable!(),
     };
-    eprintln!("using compression level: {compress:?}");
+    eprintln!("using compression: {compress:?}");
 
     let pb_in_bytes = ProgressBar::new(stat.total_bytes).with_style(
         ProgressStyle::with_template(

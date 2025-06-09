@@ -12,14 +12,19 @@ use crate::{ErrorInner, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CompressParam {
+    /// No compression.
     None,
+    /// Compress with a given ZSTD level. Requires feature `zstd`.
+    #[cfg(feature = "zstd")]
     Zstd(zstd_safe::CompressionLevel),
-    // TODO
+    /// Compress with a given LZMA (aka. xz) level. Requires feature `lzma`.
+    #[cfg(feature = "lzma")]
+    Lzma(u32),
 }
 
 #[derive(Debug)]
 pub struct Writer<W: ?Sized> {
-    workers: OrderedParallel<Vec<u8>>,
+    workers: OrderedParallel<Result<Vec<u8>>>,
     /// The total number of sections initiated, including ones that are not written yet.
     initiated_section_count: u32,
     index: IndexBuilder,
@@ -104,18 +109,19 @@ impl<W: Write> Writer<W> {
             SectionType::SECTION_INDEX,
             CompressParam::None,
             self.index.index.as_bytes(),
-        );
+        )?;
         self.w.write_all(&sec)?;
 
         Ok(())
     }
 
     fn commit_completed(
-        completed: impl Iterator<Item = Vec<u8>>,
+        completed: impl Iterator<Item = Result<Vec<u8>>>,
         w: &mut W,
         index: &mut IndexBuilder,
     ) -> Result<()> {
-        for sec in completed {
+        for ret in completed {
+            let sec = ret?;
             let off = std::mem::offset_of!(Header, section_type);
             let typ = SectionType::read_from_prefix(&sec[off..]).unwrap().0;
             w.write_all(&sec)?;
@@ -155,12 +161,15 @@ impl<W: Write> Writer<W> {
         section_type: SectionType,
         compression: CompressParam,
         payload: &[u8],
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; size_of::<Header>() + payload.len()];
+        #[cfg_attr(not(feature = "default"), allow(unused_labels))]
         let (compress_algo, compressed_len) = 'compressed: {
             let compressed_buf = &mut buf[size_of::<Header>()..];
             match compression {
                 CompressParam::None => {}
+
+                #[cfg(feature = "zstd")]
                 #[expect(non_upper_case_globals, reason = "name from C")]
                 CompressParam::Zstd(lvl) => {
                     // See: <https://github.com/gyscos/zstd-rs/issues/276>
@@ -173,12 +182,49 @@ impl<W: Write> Writer<W> {
                         }
                         Err(ZSTD_error_dstSize_tooSmall) => {}
                         Err(code) => {
-                            panic!(
-                                "compression failed (code={}): {}",
-                                code,
-                                zstd_safe::get_error_name(code)
+                            let err = std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "ZSTD compression failed (code={}): {}",
+                                    code,
+                                    zstd_safe::get_error_name(code),
+                                ),
                             );
+                            return Err(ErrorInner::Compress(err).into());
                         }
+                    }
+                }
+
+                #[cfg(feature = "lzma")]
+                CompressParam::Lzma(lvl) => {
+                    if let Some(compressed_len) = (|| {
+                        use liblzma::stream::{Action, Check, Status, Stream};
+
+                        // The default parameters used by `liblzma::bufread::XzEncoder::new`.
+                        // See: <https://docs.rs/liblzma/0.4.1/src/liblzma/bufread.rs.html#35>
+                        let mut encoder = Stream::new_easy_encoder(lvl, Check::Crc64)?;
+
+                        match encoder.process(payload, compressed_buf, Action::Run)? {
+                            // Treat partial consumption as buffer-too-small.
+                            Status::Ok if encoder.total_in() == payload.len() as u64 => {}
+                            Status::Ok | Status::MemNeeded => return Ok(None),
+                            Status::StreamEnd | Status::GetCheck => unreachable!(),
+                        }
+                        match encoder.process(
+                            &[],
+                            &mut compressed_buf[encoder.total_out() as usize..],
+                            Action::Finish,
+                        )? {
+                            Status::StreamEnd => {}
+                            Status::MemNeeded => return Ok(None),
+                            Status::Ok | Status::GetCheck => unreachable!(),
+                        }
+
+                        Ok::<_, std::io::Error>(Some(encoder.total_out() as usize))
+                    })()
+                    .map_err(ErrorInner::Compress)?
+                    {
+                        break 'compressed (CompressAlgo::LZMA, compressed_len);
                     }
                 }
             }
@@ -200,7 +246,7 @@ impl<W: Write> Writer<W> {
         header.update_size_and_checksum(compressed_buf);
         header_buf.copy_from_slice(header.as_bytes());
 
-        buf
+        Ok(buf)
     }
 
     pub fn write_metadata_sections(

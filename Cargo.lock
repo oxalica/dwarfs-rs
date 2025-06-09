@@ -247,6 +247,7 @@ dependencies = [
  "dwarfs",
  "indexmap",
  "indicatif",
+ "liblzma",
  "rustic_cdc",
  "rustix",
  "serde",
