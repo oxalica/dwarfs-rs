@@ -175,22 +175,20 @@ fn build_archive(
         let inode_meta = InodeMetadata::try_from(&os_meta)?;
 
         if ft.is_dir() {
-            let subdir = meta_builder.put_entry_dir(dir, &name_str, &inode_meta)?;
+            let subdir = meta_builder.put_dir(dir, &name_str, &inode_meta)?;
             let subiter = fs::read_dir(&subpath)?;
             stack.push((subdir, subpath, subiter));
         } else if ft.is_file() {
             let os_file = fs::File::open(&subpath)?;
             let chunks = chunker.put_reader(&mut pb_in_bytes.wrap_read(os_file))?;
-            let f = meta_builder.put_file(&inode_meta, chunks)?;
-            meta_builder.put_entry_inode(dir, &name_str, f)?;
+            meta_builder.put_file(dir, &name_str, &inode_meta, chunks)?;
         } else if ft.is_symlink() {
             let target = fs::read_link(&subpath)?;
             let target_str = target.to_string_lossy();
             if matches!(target_str, Cow::Owned(_)) {
                 eprintln!("normalized non-UTF-8 symlink target: {target:?} -> {target_str:?}");
             }
-            let symlink = meta_builder.put_symlink(&inode_meta, &target_str)?;
-            meta_builder.put_entry_inode(dir, &name_str, symlink)?;
+            meta_builder.put_symlink(dir, &name_str, &inode_meta, &target_str)?;
         } else {
             eprintln!(
                 "ignore unsupported file type {:?} for path: {}",

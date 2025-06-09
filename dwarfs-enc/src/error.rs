@@ -10,7 +10,6 @@ pub(crate) enum ErrorInner {
     Limit(&'static str),
     SerializeMetadata(dwarfs::metadata::Error),
     DuplicatedEntry,
-    UnlinkedInode,
     Compress(std::io::Error),
 
     Io(std::io::Error),
@@ -28,7 +27,6 @@ impl fmt::Display for Error {
             ErrorInner::DuplicatedEntry => f.pad("duplicated entry names in a directory"),
             ErrorInner::Limit(msg) => write!(f, "{msg}"),
             ErrorInner::SerializeMetadata(err) => err.fmt(f),
-            ErrorInner::UnlinkedInode => f.pad("an inode is unreachable from root"),
             ErrorInner::Compress(err) | ErrorInner::Io(err) => err.fmt(f),
         }
     }

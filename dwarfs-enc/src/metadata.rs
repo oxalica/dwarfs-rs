@@ -14,7 +14,11 @@
 //! (chunk) data. The total length of chunks is not limited, as long as it
 //! is addressable. Eg. It's possible to have 2²⁰ files each consists of 2²⁰
 //! chunks of 2²⁰ bytes without any issue.
-use std::{borrow::Cow, num::NonZero};
+use std::{
+    borrow::Cow,
+    hash::{Hash, Hasher},
+    num::NonZero,
+};
 
 use dwarfs::metadata;
 use indexmap::IndexSet;
@@ -129,7 +133,7 @@ pub struct Builder {
     config: Config,
 
     inodes: Vec<InodeData>,
-    dir_entries: Vec<DirEntry>,
+    dir_entries: IndexSet<DirEntry>,
     chunks: Vec<Chunk>,
     file_chunk_start: Vec<u32>,
     /// Symlinks do not store its target (index) in inode data, but is looked up
@@ -170,22 +174,18 @@ impl Builder {
         };
         this.put_inode(S_IFDIR, InodeKind::Dir, root_meta)
             .expect("no overflow");
-        this.inodes[0].linked = true;
-        this.dir_entries.push(DirEntry {
-            parent: 0,
-            child: 0,
-            // Meaningless.
-            name_idx: 0,
-        });
+        // NB. The self-link of root directory is handled in `finish`.
+        // We do not want to check duplicates against te special (0, 0, 0) link.
         this
     }
 
+    /// Get the configuration used to build this `Builder`.
     #[inline]
     pub fn config(&self) -> &Config {
         &self.config
     }
 
-    /// Get the root directory which is implicitly created.
+    /// Get the implicitly created root directory.
     #[inline]
     pub fn root(&self) -> DirId {
         DirId(0)
@@ -214,7 +214,6 @@ impl Builder {
 
         self.inodes.push(InodeData {
             kind,
-            linked: false,
             orig_ino: ino,
             mode_idx,
             uid_idx,
@@ -231,62 +230,49 @@ impl Builder {
         u32::try_from(self.dir_entries.len())
             .ok()
             .ok_or(ErrorInner::Limit("directory entry count exceeds 2^32"))?;
-        // Topological order is enforced by `put_dir` and `put_entry` APIs.
-        debug_assert!(parent.0 < child);
         let name_idx = self.name_table.insert_full(name.into()).0 as u32;
-        self.dir_entries.push(DirEntry {
+        let (_, inserted) = self.dir_entries.insert_full(DirEntry {
             parent: parent.0,
             name_idx,
             child,
         });
-        self.inodes[child as usize].linked = true;
+        if !inserted {
+            return Err(ErrorInner::DuplicatedEntry.into());
+        }
         Ok(())
     }
 
-    /// Add an empty directory as a child of an existing directory.
-    ///
-    /// # Preconditions
-    ///
-    /// The caller must ensure the uniqueness of `name` in a `dir`.
-    /// It is not checked by this method, but errors will be emitted later
-    /// during [`Builder::finish`].
+    /// Add an empty directory under a directory.
     ///
     /// # Errors
     ///
-    /// Return `Err` on inode count or directory entry count overflows.
+    /// Return `Err` if either:
+    ///
+    /// - Inode count overflows.
+    /// - Directory entry count overflows.
+    /// - There is already an entry with the same name in the directory.
     #[inline]
-    pub fn put_entry_dir(
-        &mut self,
-        parent: DirId,
-        name: &str,
-        meta: &InodeMetadata,
-    ) -> Result<DirId> {
+    pub fn put_dir(&mut self, parent: DirId, name: &str, meta: &InodeMetadata) -> Result<DirId> {
         let ino = self.put_inode(S_IFDIR, InodeKind::Dir, meta)?;
         self.put_entry_inner(parent, name, ino)?;
         Ok(DirId(ino))
     }
 
-    /// Add a non-directory inode as a child of an existing directory.
-    ///
-    /// # Preconditions
-    ///
-    /// The caller must ensure the uniqueness of `name` in a `dir`.
-    /// It is not checked by this method, but errors will be emitted later
-    /// during [`Builder::finish`].
+    /// Add a hard link to an existing inode under a directory.
     ///
     /// # Errors
     ///
-    /// Return `Err` on inode count or directory entry count overflows.
-    pub fn put_entry_inode(
+    /// See [`Builder::put_dir`].
+    pub fn put_hard_link(
         &mut self,
         parent: DirId,
         name: &str,
-        entry: impl Into<NonDirInodeId>,
+        inode: impl Into<LinkableInodeId>,
     ) -> Result<()> {
-        self.put_entry_inner(parent, name, entry.into().0)
+        self.put_entry_inner(parent, name, inode.into().0)
     }
 
-    /// Add a regular file and returns its handle.
+    /// Add a regular file under a directory.
     ///
     /// # Panics
     ///
@@ -294,9 +280,11 @@ impl Builder {
     ///
     /// # Errors
     ///
-    /// Return `Err` on inode count or chunk count overflows.
+    /// See [`Builder::put_dir`].
     pub fn put_file(
         &mut self,
+        parent: DirId,
+        name: &str,
         meta: &InodeMetadata,
         chunks: impl IntoIterator<Item = Chunk>,
     ) -> Result<FileId> {
@@ -317,54 +305,100 @@ impl Builder {
         }
         let ino = self.put_inode(S_IFREG, InodeKind::UniqueFile, meta)?;
         self.file_chunk_start.push(chunk_start);
+        self.put_entry_inner(parent, name, ino)?;
         Ok(FileId(ino))
     }
 
-    /// Add a symbolic link (symlink) and return its handle.
+    /// Add a symbolic link (symlink) under a directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`Builder::put_dir`].
     #[inline]
-    pub fn put_symlink(&mut self, meta: &InodeMetadata, target: &str) -> Result<NonDirInodeId> {
+    pub fn put_symlink(
+        &mut self,
+        parent: DirId,
+        name: &str,
+        meta: &InodeMetadata,
+        target: &str,
+    ) -> Result<LinkableInodeId> {
         let ino = self.put_inode(S_IFLNK, InodeKind::Symlink, meta)?;
         let tgt_idx = self.symlink_table.insert_full(target.into()).0 as u32;
         self.symlink_target_idxs.push(tgt_idx);
-        Ok(NonDirInodeId(ino))
+        self.put_entry_inner(parent, name, ino)?;
+        Ok(LinkableInodeId(ino))
     }
 
-    /// Add a block device inode and return its handle.
+    /// Add a block device inode under a directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`Builder::put_dir`].
     #[inline]
     pub fn put_block_device(
         &mut self,
+        parent: DirId,
+        name: &str,
         meta: &InodeMetadata,
         device_id: u64,
-    ) -> Result<NonDirInodeId> {
+    ) -> Result<LinkableInodeId> {
         let ino = self.put_inode(S_IFBLK, InodeKind::Device, meta)?;
         self.devices.push(device_id);
-        Ok(NonDirInodeId(ino))
+        self.put_entry_inner(parent, name, ino)?;
+        Ok(LinkableInodeId(ino))
     }
 
-    /// Add a character device inode and return its handle.
+    /// Add a character device inode under a directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`Builder::put_dir`].
     #[inline]
     pub fn put_char_device(
         &mut self,
+        parent: DirId,
+        name: &str,
         meta: &InodeMetadata,
         device_id: u64,
-    ) -> Result<NonDirInodeId> {
+    ) -> Result<LinkableInodeId> {
         let ino = self.put_inode(S_IFCHR, InodeKind::Device, meta)?;
         self.devices.push(device_id);
-        Ok(NonDirInodeId(ino))
+        self.put_entry_inner(parent, name, ino)?;
+        Ok(LinkableInodeId(ino))
     }
 
-    /// Add a FIFO (named pipe) inode and return its handle.
+    /// Add a FIFO (named pipe) inode under a directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`Builder::put_dir`].
     #[inline]
-    pub fn put_fifo(&mut self, meta: &InodeMetadata) -> Result<NonDirInodeId> {
-        self.put_inode(S_IFIFO, InodeKind::Ipc, meta)
-            .map(NonDirInodeId)
+    pub fn put_fifo(
+        &mut self,
+        parent: DirId,
+        name: &str,
+        meta: &InodeMetadata,
+    ) -> Result<LinkableInodeId> {
+        let ino = self.put_inode(S_IFIFO, InodeKind::Ipc, meta)?;
+        self.put_entry_inner(parent, name, ino)?;
+        Ok(LinkableInodeId(ino))
     }
 
-    /// Add a socket inode and return its handle.
+    /// Add a socket inode under a directory.
+    ///
+    /// # Errors
+    ///
+    /// See [`Builder::put_dir`].
     #[inline]
-    pub fn put_socket(&mut self, meta: &InodeMetadata) -> Result<NonDirInodeId> {
-        self.put_inode(S_IFSOCK, InodeKind::Ipc, meta)
-            .map(NonDirInodeId)
+    pub fn put_socket(
+        &mut self,
+        parent: DirId,
+        name: &str,
+        meta: &InodeMetadata,
+    ) -> Result<LinkableInodeId> {
+        let ino = self.put_inode(S_IFSOCK, InodeKind::Ipc, meta)?;
+        self.put_entry_inner(parent, name, ino)?;
+        Ok(LinkableInodeId(ino))
     }
 
     // TODO: FSST compressor.
@@ -403,8 +437,6 @@ impl Builder {
     /// Returns `Err` if the hierarchy is invalid, or exceeds certain limitations,
     /// including and not limited to:
     /// - Duplicated entry names in a directory.
-    /// - An inode is not linked to any directory via [`Builder::put_entry`]
-    ///   thus is unreachable from root.
     /// - Any (intermediate) low-level structures exceeds 2³² bytes.
     ///   See [module level documentations][self].
     pub fn finish(mut self) -> Result<metadata::Metadata> {
@@ -430,11 +462,6 @@ impl Builder {
             }
             map
         };
-
-        if self.inodes.iter().any(|inode| !inode.linked) {
-            // TODO: More error context.
-            return Err(ErrorInner::UnlinkedInode.into());
-        }
 
         out.inodes = self
             .inodes
@@ -463,15 +490,22 @@ impl Builder {
         // Directory relative order is kept unchanged because of stable sort above.
         // So this will sort `dir_entries` to the final order.
         // Note that `dir_entries[0]` is the self-link for the root directory.
-        self.dir_entries[1..]
+        let mut dir_entries = std::iter::once(DirEntry {
+            parent: 0,
+            child: 0,
+            // This index is unused.
+            name_idx: 0,
+        })
+        .chain(self.dir_entries)
+        .collect::<Vec<_>>();
+        dir_entries[1..]
             .sort_by_key(|ent| (ent.parent, &self.name_table[ent.name_idx as usize][..]));
-        if self.dir_entries[1..]
-            .windows(2)
-            .any(|w| (w[0].parent, w[0].name_idx) == (w[1].parent, w[1].name_idx))
-        {
-            // TODO: More error context.
-            return Err(ErrorInner::DuplicatedEntry.into());
-        }
+        // Checked on inserting entries.
+        debug_assert!(
+            dir_entries[1..]
+                .windows(2)
+                .all(|w| (w[0].parent, w[0].name_idx) != (w[1].parent, w[1].name_idx))
+        );
 
         // Initialize directories links.
         {
@@ -490,8 +524,7 @@ impl Builder {
                 let parent_entry = dir.self_entry;
 
                 // Update parent links of child directories.
-                while let Some(ent) = self
-                    .dir_entries
+                while let Some(ent) = dir_entries
                     .get(offset as usize)
                     .filter(|ent| ent.parent == inode.orig_ino)
                 {
@@ -503,14 +536,14 @@ impl Builder {
                     offset += 1;
                 }
             }
-            debug_assert_eq!(offset as usize, self.dir_entries.len());
+            debug_assert_eq!(offset as usize, dir_entries.len());
 
             // Sentinel.
-            out.directories.last_mut().unwrap().first_entry = self.dir_entries.len() as u32;
+            out.directories.last_mut().unwrap().first_entry = dir_entries.len() as u32;
         }
 
         out.dir_entries = Some(
-            self.dir_entries
+            dir_entries
                 .into_iter()
                 .map(|ent| {
                     let mut out = metadata::DirEntry::default();
@@ -568,6 +601,20 @@ struct DirEntry {
     child: u32,
 }
 
+// Hash and Eq impls are only on `(parent, name_idx)` pair, because we want to
+// check entry names in a directory do not duplicate.
+impl Hash for DirEntry {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        h.write_u64(u64::from(self.parent) | u64::from(self.name_idx) << 32);
+    }
+}
+impl PartialEq for DirEntry {
+    fn eq(&self, other: &Self) -> bool {
+        (self.parent, self.name_idx) == (other.parent, other.name_idx)
+    }
+}
+impl Eq for DirEntry {}
+
 /// A chunk of data for a regular file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chunk {
@@ -593,8 +640,6 @@ struct InodeData {
     kind: InodeKind,
     // To maintain mapping after sorting inodes by their kinds.
     orig_ino: u32,
-    // Is this inode reachable from root?
-    linked: bool,
 
     mode_idx: u32,
     uid_idx: u32,
@@ -712,15 +757,19 @@ impl InodeMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DirId(u32);
 
-/// A handle to a non-directory inode.
+/// A handle to an inode that is allowed to be hard-linked.
+///
+/// All inodes except directories are linkable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct NonDirInodeId(u32);
+pub struct LinkableInodeId(u32);
 
 /// A handle to a regular file inode.
+///
+/// This type implements `Into<LinkableInodeId>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId(u32);
 
-impl From<FileId> for NonDirInodeId {
+impl From<FileId> for LinkableInodeId {
     fn from(i: FileId) -> Self {
         Self(i.0)
     }
