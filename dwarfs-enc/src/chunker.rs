@@ -1,6 +1,9 @@
+//! File data slicing and/or deduplication.
 use std::{
     collections::{HashMap, hash_map::Entry},
+    fmt,
     io::{Read, Write},
+    num::NonZero,
 };
 
 use dwarfs::section::SectionType;
@@ -13,36 +16,62 @@ use crate::{
     section::{self, CompressParam},
 };
 
-pub type Chunks = Vec<Chunk>;
+type Chunks = Vec<Chunk>;
 
 /// Algorithm to slice and/or deduplicate file content.
 pub trait Chunker {
-    /// Add a file reader into the archive, and return the chunking result.
+    /// Put data via a [`Read`] instance into the archive, and return the
+    /// chunking result ready for [`crate::metadata::Builder::put_file`].
     fn put_reader(&mut self, rdr: &mut dyn Read) -> Result<Chunks>;
+
+    /// Put in-memory data into the archive.
+    ///
+    /// This is a shortcut to [`Chunker::put_reader`].
+    fn put_bytes(&mut self, mut bytes: &[u8]) -> Result<Chunks> {
+        self.put_reader(&mut bytes)
+    }
 }
 
 /// The simplest chunker to concat all files and slice data at block size.
 ///
 /// This does no deduplication.
-#[derive(Debug)]
-pub struct ConcatChunker<W> {
+pub struct BasicChunker<W> {
     buf: Box<[u8]>,
     buf_len: usize,
     compression: CompressParam,
     w: section::Writer<W>,
 }
 
-impl<W> ConcatChunker<W> {
-    // FIXME: Reuse `metadata::Config`
-    pub fn new(w: section::Writer<W>, block_size: u32, compression: CompressParam) -> Self {
+impl<W: fmt::Debug> fmt::Debug for BasicChunker<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BasicChunker")
+            .field("buf", &format_args!("{}/{}", self.buf_len, self.buf.len()))
+            .field("compression", &self.compression)
+            .field("w", &self.w)
+            .finish()
+    }
+}
+
+impl<W> BasicChunker<W> {
+    /// Create a basic chunker with given section writer and parameters.
+    ///
+    /// Note: `block_size` must match the block size configured for
+    /// [`crate::metadata::Builder`]. You should always get it from
+    /// [`crate::metadata::Builder::block_size`].
+    pub fn new(
+        w: section::Writer<W>,
+        block_size: NonZero<u32>,
+        compression: CompressParam,
+    ) -> Self {
         Self {
-            buf: vec![0u8; block_size as usize].into_boxed_slice(),
+            buf: vec![0u8; block_size.get() as usize].into_boxed_slice(),
             buf_len: 0,
             compression,
             w,
         }
     }
 
+    /// Finalize data chunks and get back the underlying section writer.
     pub fn finish(mut self) -> Result<section::Writer<W>>
     where
         W: Write,
@@ -124,7 +153,7 @@ impl SeqChunks {
     }
 }
 
-impl<W: Write> Chunker for ConcatChunker<W> {
+impl<W: Write> Chunker for BasicChunker<W> {
     fn put_reader(&mut self, rdr: &mut dyn Read) -> Result<Chunks> {
         let seq = self.put_reader_inner(rdr)?;
         Ok(seq.to_chunks(self.buf.len() as u32).collect())
@@ -135,13 +164,23 @@ impl<W: Write> Chunker for ConcatChunker<W> {
 ///
 /// The exact algorithm used may change. Currently it uses [rustic_cdc].
 pub struct CdcChunker<W> {
-    inner: ConcatChunker<W>,
+    inner: BasicChunker<W>,
     // TODO: This struct is too large.
     rabin: Rabin64,
     chunk_buf: Box<[u8]>,
 
     table: HashMap<u64, CdcChunk>,
     deduplicated_bytes: u64,
+}
+
+impl<W: fmt::Debug> fmt::Debug for CdcChunker<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CdcChunker")
+            .field("inner", &self.inner)
+            .field("table_size", &self.table.len())
+            .field("deduplicated_bytes", &self.deduplicated_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 struct CdcChunk {
@@ -157,7 +196,8 @@ impl<W> CdcChunker<W> {
     const MIN_CHUNK_SIZE: usize = Self::WINDOW_SIZE;
     const MAX_CHUNK_SIZE: usize = 64 << 10;
 
-    pub fn new(inner: ConcatChunker<W>) -> Self {
+    /// Create the deduplicating chunker on top of a [`BasicChunker`].
+    pub fn new(inner: BasicChunker<W>) -> Self {
         let rabin = Rabin64::new(Self::WINDOW_SIZE_BITS);
         CdcChunker {
             inner,
@@ -168,15 +208,17 @@ impl<W> CdcChunker<W> {
         }
     }
 
+    /// Get the total deduplicated bytes.
     pub fn deduplicated_bytes(&self) -> u64 {
         self.deduplicated_bytes
     }
 
-    pub fn into_inner(self) -> ConcatChunker<W>
+    /// Finalize data chunks and get back the underlying section writer.
+    pub fn finish(self) -> Result<section::Writer<W>>
     where
         W: Write,
     {
-        self.inner
+        self.inner.finish()
     }
 }
 

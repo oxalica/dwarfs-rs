@@ -1,3 +1,4 @@
+//! DwarFS section writer.
 use std::io::Write;
 use std::num::NonZero;
 
@@ -22,6 +23,7 @@ pub enum CompressParam {
     Lzma(u32),
 }
 
+/// DwarFS section writer.
 #[derive(Debug)]
 pub struct Writer<W: ?Sized> {
     workers: OrderedParallel<Result<Vec<u8>>>,
@@ -39,7 +41,7 @@ struct IndexBuilder {
 }
 
 impl IndexBuilder {
-    pub fn push(&mut self, typ: SectionType, sec_raw_len: usize) -> Result<()> {
+    fn push(&mut self, typ: SectionType, sec_raw_len: usize) -> Result<()> {
         let ent = SectionIndexEntry::new(typ, self.next_offset).expect("checked by last write");
         self.next_offset = u64::try_from(sec_raw_len)
             .ok()
@@ -52,12 +54,14 @@ impl IndexBuilder {
 }
 
 impl<W> Writer<W> {
+    /// Create a default multi-threaded section writer.
     pub fn new(w: W) -> std::io::Result<Self> {
         let thread_cnt = std::thread::available_parallelism()?;
-        Self::new_with_thread_cnt(w, thread_cnt)
+        Self::new_with_threads(w, thread_cnt)
     }
 
-    pub fn new_with_thread_cnt(w: W, thread_cnt: NonZero<usize>) -> std::io::Result<Self> {
+    /// Create a section writer with specific parallelism.
+    pub fn new_with_threads(w: W, thread_cnt: NonZero<usize>) -> std::io::Result<Self> {
         let workers = OrderedParallel::new("compressor", thread_cnt)?;
         Ok(Self {
             workers,
@@ -69,14 +73,17 @@ impl<W> Writer<W> {
 }
 
 impl<W: ?Sized> Writer<W> {
+    /// Get a reference to the underlying writer.
     pub fn get_ref(&self) -> &W {
         &self.w
     }
 
+    /// Get a mutable reference tothe underlying writer.
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.w
     }
 
+    /// Retrieve the ownership of the underlying reader.
     pub fn into_inner(self) -> W
     where
         W: Sized,
@@ -93,7 +100,8 @@ impl<W: Write> Writer<W> {
         self.initiated_section_count
     }
 
-    pub fn finish(&mut self) -> Result<()> {
+    /// Finalize and seal the DwarFS archive.
+    pub fn finish(mut self) -> Result<W> {
         // Wait for all proceeding sections to complete, so their offsets are recorded.
         self.workers.stop();
         while let Some(iter) = self.workers.wait_and_get() {
@@ -112,7 +120,7 @@ impl<W: Write> Writer<W> {
         )?;
         self.w.write_all(&sec)?;
 
-        Ok(())
+        Ok(self.w)
     }
 
     fn commit_completed(
@@ -130,6 +138,7 @@ impl<W: Write> Writer<W> {
         Ok(())
     }
 
+    /// Write a section with given (uncompressed) payload.
     pub fn write_section(
         &mut self,
         section_type: SectionType,
@@ -249,6 +258,7 @@ impl<W: Write> Writer<W> {
         Ok(buf)
     }
 
+    /// Write metadata sections `METADATA_V2_{,_SCHEMA}`.
     pub fn write_metadata_sections(
         &mut self,
         metadata: &dwarfs::metadata::Metadata,

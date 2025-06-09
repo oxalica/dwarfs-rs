@@ -1,10 +1,9 @@
 //! Run tasks in parallel while keeping the original order.
 
-use std::{num::NonZero, panic, thread};
+use std::{fmt, num::NonZero, panic, thread};
 
 use crossbeam_channel as mpmc;
 
-#[derive(Debug)]
 pub struct OrderedParallel<R> {
     injector: Option<mpmc::Sender<Task<R>>>,
     collector: mpmc::Receiver<TaskResult<R>>,
@@ -13,6 +12,17 @@ pub struct OrderedParallel<R> {
     ring_buf: Box<[Option<R>]>,
 
     threads: Box<[thread::JoinHandle<()>]>,
+}
+
+impl<R> fmt::Debug for OrderedParallel<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OrderedParallel")
+            .field("next_to_send", &self.next_to_send)
+            .field("next_to_recv", &self.next_to_recv)
+            .field("ring_buf_size", &self.ring_buf.len())
+            .field("threads_cnt", &self.threads.len())
+            .finish_non_exhaustive()
+    }
 }
 
 type Task<R> = (usize, Box<dyn FnOnce() -> R + Send>);

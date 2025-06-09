@@ -1,3 +1,4 @@
+#![expect(clippy::print_stderr, reason = "allowed in examples")]
 use std::{
     borrow::Cow,
     fs,
@@ -41,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&cli.output)?;
 
     let root_meta = fs::metadata(&cli.input)?;
-    let root_meta = InodeMetadata::try_from(&root_meta)?;
+    let root_meta = InodeMetadata::from(&root_meta);
 
     let stat = {
         let progress = ProgressBar::new_spinner();
@@ -79,11 +80,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pb_out_bytes.tick();
 
     let mut builder = MetadataBuilder::new(&root_meta);
-    let writer = section::Writer::new(fout_pb).unwrap();
-    let chunker = chunker::ConcatChunker::new(writer, 16 << 20, compress);
+    let writer = section::Writer::new(fout_pb)?;
+    let chunker = chunker::BasicChunker::new(writer, builder.block_size(), compress);
     let mut chunker = chunker::CdcChunker::new(chunker);
 
-    build_archive(&mut builder, &mut chunker, &cli.input, &pb_in_bytes).unwrap();
+    build_archive(&mut builder, &mut chunker, &cli.input, &pb_in_bytes)?;
 
     pb_in_bytes.finish();
     pbs.println(format!(
@@ -92,12 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
 
     pbs.println("finalizing metadata")?;
-    let mut w = chunker.into_inner().finish().unwrap();
-    w.write_metadata_sections(&builder.finish().unwrap(), compress)
-        .unwrap();
+    let mut w = chunker.finish()?;
+    w.write_metadata_sections(&builder.finish()?, compress)?;
 
     pbs.println("waiting for compression to finish")?;
-    w.finish().unwrap();
+    w.finish()?;
     pb_out_bytes.finish();
 
     let output_len = fout.metadata()?.len();
@@ -172,7 +172,7 @@ fn build_archive(
 
         let ft = ent.file_type()?;
         let os_meta = ent.metadata()?;
-        let inode_meta = InodeMetadata::try_from(&os_meta)?;
+        let inode_meta = InodeMetadata::from(&os_meta);
 
         if ft.is_dir() {
             let subdir = meta_builder.put_dir(dir, &name_str, &inode_meta)?;

@@ -29,3 +29,9 @@ indicatif = "0.17.11"
 [[example]]
 name = "mkdwarfs"
 required-features = ["zstd", "lzma"]
+
+[lints.clippy]
+dbg-macro = "warn"
+todo = "warn"
+print-stdout = "warn"
+print-stderr = "warn"

@@ -82,10 +82,6 @@ impl Config {
         self
     }
 
-    pub fn get_block_size(&self) -> NonZero<u32> {
-        self.block_size
-    }
-
     /// Only store file modification time (mtime) and ignore access (atime) or
     /// change (ctime) times.
     ///
@@ -198,10 +194,9 @@ impl Builder {
         this
     }
 
-    /// Get the configuration used to build this `Builder`.
-    #[inline]
-    pub fn config(&self) -> &Config {
-        &self.config
+    /// Get the configured block size.
+    pub fn block_size(&self) -> NonZero<u32> {
+        self.config.block_size
     }
 
     /// Get the implicitly created root directory.
@@ -640,11 +635,21 @@ impl PartialEq for DirEntry {
 }
 impl Eq for DirEntry {}
 
-/// A chunk of data for a regular file.
+/// The location of a chunk of data for a regular file.
+///
+/// Usually, you should use [`crate::chunker::Chunker`]s to slice file data into
+/// [`Chunk`]s and copy data at the same time, rather than manually constructing
+/// them.
+///
+/// For details about data chunking and the meaning of fields, check
+/// [upstream documentations](https://github.com/mhx/dwarfs/blob/v0.12.4/doc/dwarfs-format.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chunk {
+    /// The section index.
     pub section_idx: u32,
+    /// The byte offset inside the section.
     pub offset: u32,
+    /// The size of the chunk.
     pub size: u32,
 }
 
@@ -685,10 +690,8 @@ pub struct InodeMetadata {
     ctime: SystemTime,
 }
 
-impl TryFrom<&std::fs::Metadata> for InodeMetadata {
-    type Error = Error;
-
-    fn try_from(meta: &std::fs::Metadata) -> Result<Self, Self::Error> {
+impl From<&std::fs::Metadata> for InodeMetadata {
+    fn from(meta: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 
@@ -716,7 +719,7 @@ impl TryFrom<&std::fs::Metadata> for InodeMetadata {
             ret.ctime(ctime).uid(meta.uid()).gid(meta.gid());
         }
 
-        Ok(ret)
+        ret
     }
 }
 

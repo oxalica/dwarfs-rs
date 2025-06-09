@@ -1,7 +1,9 @@
 use std::fmt;
 
+/// A `Result` with default error [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// An error representing any possible error raised from this crate.
 pub struct Error(Box<ErrorInner>);
 
 #[derive(Debug)]
