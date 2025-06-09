@@ -1,6 +1,6 @@
 # dwarfs-enc
 
-A library for building and writing [DwarFS][dwarfs] archives (aka. DwarFS images),
+A library for writing [DwarFS][dwarfs] archives (aka. DwarFS images),
 building on top of [`dwarfs` crate][dwarfs-rs].
 
 [dwarfs]: https://github.com/mhx/dwarfs

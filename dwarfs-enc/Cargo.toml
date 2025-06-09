@@ -3,6 +3,10 @@ name = "dwarfs-enc"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
+description = "A library for writing DwarFS archives (aka. DwarFS images)"
+keywords = ["dwarfs", "archive", "compression"]
+categories = ["compression", "filesystem"]
+repository = "https://github.com/oxalica/dwarfs-rs"
 
 [features]
 default = ["zstd"]
