@@ -32,7 +32,8 @@ impl<R> Drop for OrderedParallel<R> {
 
 impl<R: Send + 'static> OrderedParallel<R> {
     pub fn new(thread_name: &str, thread_cnt: NonZero<usize>) -> std::io::Result<Self> {
-        let max_inflights = thread_cnt.saturating_add(1);
+        // Random picked: 1.5x.
+        let max_inflights = thread_cnt.saturating_add(thread_cnt.get().div_ceil(2));
 
         let (injector, injector_rx) = mpmc::bounded(max_inflights.get());
         let (collector_tx, collector) = mpmc::bounded(max_inflights.get());
