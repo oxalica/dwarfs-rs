@@ -23,7 +23,7 @@ struct Cli {
     force: bool,
 
     #[arg(long, short = 'l', default_value_t = 22)]
-    compress_level: u8,
+    compress_level: i32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

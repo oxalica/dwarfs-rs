@@ -13,7 +13,7 @@ use crate::{ErrorInner, Result};
 #[non_exhaustive]
 pub enum CompressParam {
     None,
-    Zstd(u8),
+    Zstd(zstd_safe::CompressionLevel),
     // TODO
 }
 
@@ -166,7 +166,7 @@ impl<W: Write> Writer<W> {
                     // See: <https://github.com/gyscos/zstd-rs/issues/276>
                     const ZSTD_error_dstSize_tooSmall: zstd_safe::ErrorCode = -70isize as usize;
 
-                    match zstd_safe::compress(compressed_buf, payload, lvl.into()) {
+                    match zstd_safe::compress(compressed_buf, payload, lvl) {
                         Ok(compressed_len) => {
                             assert!(compressed_len <= payload.len());
                             break 'compressed (CompressAlgo::ZSTD, compressed_len);
