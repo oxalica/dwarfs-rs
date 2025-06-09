@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## v0.2.1
+
+### Changed
+
+### Added
+
+- FSST symtab serialization `fsst::to_bytes`.
+
+- DwarFS metadata serialization `Metadata::to_schema_and_bytes`.
+  
+  This implements basic serialization support of Frozen. It uses fixed-width
+  integers and does not yet support bit-packing.
+
+- Missed `Metadata::reg_file_size_cache` field.
+
+- `section::Header::update_size_and_checksum`
+
+- `section::MagicVersion::LATEST`
+
+### Others
+
+- Switch from `xz2` to `liblzma` crate for LZMA decompression.
+
+- Remove unused high-level wrapper crate `zstd` and use `zstd-safe` directly.
+
+- Add more tests.
+
 ## v0.2.0
 
 ### Changed

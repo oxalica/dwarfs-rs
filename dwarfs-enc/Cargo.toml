@@ -16,7 +16,7 @@ lzma = ["dep:liblzma"]
 
 [dependencies]
 crossbeam-channel = "0.5.15"
-dwarfs = { version = "0.2.0", path = "../dwarfs", features = ["serialize"] }
+dwarfs = { version = "0.2.1", path = "../dwarfs", features = ["serialize"] }
 indexmap = "2.9.0"
 liblzma = { version = "0.4.1", optional = true }
 rustic_cdc = "0.3.1"
