@@ -13,7 +13,7 @@
 //! - Metadata definition: <https://github.com/mhx/dwarfs/blob/v0.12.4/thrift/metadata.thrift>
 //!
 //! - Frozen schema definition: <https://github.com/facebook/fbthrift/blob/2f5415eed3a4981b5b1535a504a76b9309834a90/thrift/lib/thrift/frozen.thrift>
-//!   
+//!
 //!   Typically, users should treat [`Schema`] as an opaque type, because the
 //!   definition in this crate is specialized only for [`Metadata::parse`].
 use std::{borrow::Borrow, fmt, marker::PhantomData, ops};
@@ -506,6 +506,14 @@ pub struct Metadata {
     pub category_names: Option<Vec<BString>>,
     pub block_categories: Option<Vec<BString>>,
     pub reg_file_size_cache: Option<InodeSizeCache>,
+
+    // #31
+    pub category_metadata_json: Option<Vec<BString>>,
+    pub block_category_metadata: Option<OrderedMap<u32, u32>>,
+    pub metadata_version_history: Option<Vec<u8>>,
+    pub hole_block_index: Option<u32>,
+    pub large_hole_size: Option<Vec<u64>>,
+    pub total_allocated_fs_size: Option<u64>,
 }
 
 /// See [module level documentation][self] for details.
@@ -575,6 +583,9 @@ pub struct FsOptions {
     pub packed_chunk_table: bool,
     pub packed_directories: bool,
     pub packed_shared_files_table: bool,
+    pub subsecond_resolution_nsec_multiplier: Option<u32>,
+    pub has_btime: bool,
+    pub inodes_have_nlink: bool,
 }
 
 /// See [module level documentation][self] for details.
@@ -599,4 +610,5 @@ pub struct InodeSizeCache {
     // NB. Field order matters for ser/de impl.
     pub lookup: OrderedMap<u32, u64>,
     pub min_chunk_count: u64,
+    pub allocated_size_lookup: OrderedMap<u32, u64>,
 }

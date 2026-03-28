@@ -425,8 +425,11 @@ impl ArchiveIndex {
 
         // Explicit future-incompatible features.
         if let Some(feat) = &m.features {
-            if !feat.is_empty() {
-                bail!(ErrorInner::UnsupportedFeature(format!("{feat:?}")));
+            for f in &feat.0 {
+                match f.as_slice() {
+                    b"sparsefiles" => {}
+                    other => bail!(ErrorInner::UnsupportedFeature(format!("{other:?}"))),
+                }
             }
         }
 
@@ -645,12 +648,18 @@ impl ArchiveIndex {
                 .or_context("invalid block_size")?;
 
             let sections = self.section_index.len() as u32;
+            let hole_block_index = m.hole_block_index.unwrap_or(sections);
             for c in &m.chunks {
-                check!(c.block < sections, "chunks.block");
-                c.offset
-                    .checked_add(c.size)
-                    .filter(|&end| end <= block_size)
-                    .context("offset out of range in chunks")?;
+                check!(
+                    c.block < sections || c.block == hole_block_index,
+                    "chunks.block"
+                );
+                if c.block != hole_block_index {
+                    c.offset
+                        .checked_add(c.size)
+                        .filter(|&end| end <= block_size)
+                        .context("offset out of range in chunks")?;
+                }
             }
 
             let entries = dir_entries.len() as u32;
@@ -829,6 +838,7 @@ pub struct Archive<R: ?Sized> {
     /// LRU cache of block idx -> block content.
     cache: LruCache<u32, Vec<u8>>,
     block_size: u32,
+    hole_data: Vec<u8>,
 
     rdr: SectionReader<R>,
 }
@@ -875,6 +885,7 @@ impl<R: ReadAt + Size> Archive<R> {
         Ok(Self {
             cache: LruCache::new(cache_len),
             block_size,
+            hole_data: Vec::new(),
             rdr,
         })
     }
@@ -934,6 +945,15 @@ impl<R: ReadAt + ?Sized> Archive<R> {
             },
         )?;
         Ok(chunk)
+    }
+
+    fn get_hole_data(&mut self, len: usize) -> Result<&[u8]> {
+        if self.hole_data.len() < len {
+            let extra = len - self.hole_data.len();
+            self.hole_data.resize(len, 0);
+            self.hole_data[len - extra..].fill(0);
+        }
+        Ok(&self.hole_data[..len])
     }
 }
 
@@ -1525,7 +1545,15 @@ pub struct ChunkIter<'a> {
 impl ChunkIter<'_> {
     /// Iterate over all chunks and return the sum of all chunks' byte length.
     pub fn total_size(&self) -> u64 {
-        self.clone().map(|c| u64::from(c.size())).sum::<u64>()
+        self.clone()
+            .map(|c| {
+                if c.is_hole() {
+                    c.hole_size()
+                } else {
+                    u64::from(c.size())
+                }
+            })
+            .sum::<u64>()
     }
 }
 
@@ -1587,11 +1615,37 @@ impl<'a> Chunk<'a> {
         self.size
     }
 
+    fn is_hole(&self) -> bool {
+        let hole_idx = self
+            .index
+            .metadata
+            .hole_block_index
+            .unwrap_or(self.index.section_index.len() as u32);
+        self.block == hole_idx
+    }
+
+    fn hole_size(&self) -> u64 {
+        let block_size = u64::from(self.index.metadata.block_size);
+        if self.offset as usize + 1 == block_size as usize
+            && let Some(ref large_holes) = self.index.metadata.large_hole_size
+            && let Some(&extra) = large_holes.get(self.size as usize)
+        {
+            return u64::from(self.offset) + extra * block_size;
+        }
+        u64::from(self.offset) + u64::from(self.size) * block_size
+    }
+
     /// Read this chunk into [`Archive`]'s cache if needed and return the bytes.
     ///
     /// If the section (block) containing this chunk is already in cache, this
     /// function performs no read on the underlying stream.
     pub fn read_cached<'b, R: ReadAt>(&self, archive: &'b mut Archive<R>) -> Result<&'b [u8]> {
+        if self.is_hole() {
+            let len = usize::try_from(self.hole_size())
+                .ok()
+                .context("hole size too large")?;
+            return archive.get_hole_data(len);
+        }
         archive.cache_block(self.index, self.section_idx())?;
         // Chunk offsets will not overflow, checked by `unpack_validate`.
         archive.get_chunk_in_cache(self.offset(), self.offset() + self.size())
@@ -1637,6 +1691,9 @@ pub trait AsChunks<'a>: Sized + sealed::Sealed {
             chunks: self.as_chunks(),
             in_section_offset: 0,
             chunk_rest_size: 0,
+            is_hole: false,
+            hole_consumed: 0,
+            hole_total: 0,
         }
     }
 
@@ -1687,6 +1744,9 @@ pub struct ChunksReader<'a, 'b, R: ?Sized> {
     chunks: ChunkIter<'a>,
     in_section_offset: u32,
     chunk_rest_size: u32,
+    is_hole: bool,
+    hole_consumed: usize,
+    hole_total: usize,
     archive: &'b mut Archive<R>,
 }
 
@@ -1719,10 +1779,24 @@ impl<R: ReadAt + ?Sized> Read for ChunksReader<'_, '_, R> {
 
 impl<R: ReadAt + ?Sized> BufRead for ChunksReader<'_, '_, R> {
     fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.is_hole {
+            return Ok(&self.archive.hole_data[self.hole_consumed..self.hole_total]);
+        }
         if self.chunk_rest_size == 0 {
             let Some(chunk) = self.chunks.next() else {
                 return Ok(&[]);
             };
+            if chunk.is_hole() {
+                self.is_hole = true;
+                self.hole_consumed = 0;
+                self.hole_total = usize::try_from(chunk.hole_size()).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "hole too large")
+                })?;
+                if self.archive.hole_data.len() < self.hole_total {
+                    self.archive.hole_data.resize(self.hole_total, 0);
+                }
+                return Ok(&self.archive.hole_data[..self.hole_total]);
+            }
             self.in_section_offset = chunk.offset();
             self.chunk_rest_size = chunk.size();
             self.archive.cache_block(chunk.index, chunk.section_idx())?;
@@ -1737,6 +1811,15 @@ impl<R: ReadAt + ?Sized> BufRead for ChunksReader<'_, '_, R> {
 
     #[inline]
     fn consume(&mut self, amt: usize) {
+        if self.is_hole {
+            self.hole_consumed += amt;
+            if self.hole_consumed >= self.hole_total {
+                self.is_hole = false;
+                self.hole_consumed = 0;
+                self.hole_total = 0;
+            }
+            return;
+        }
         assert!(amt <= self.chunk_rest_size as usize);
         self.in_section_offset += amt as u32;
         self.chunk_rest_size -= amt as u32;
