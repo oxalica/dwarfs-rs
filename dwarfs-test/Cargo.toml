@@ -17,4 +17,4 @@ rustix = { version = "1.0.7", features = ["fs", "process", "use-libc"] }
 
 [dev-dependencies]
 hex = "0.4.3"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
