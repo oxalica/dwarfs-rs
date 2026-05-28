@@ -10,7 +10,7 @@
     in
     {
       devShells = eachSystems (
-        system: pkgs: rec {
+        system: pkgs: {
           without-rust = pkgs.mkShell {
             nativeBuildInputs = [
               pkgs.dwarfs
