@@ -45,6 +45,14 @@
 //!   Enable relevant decompression algorithm support. `zstd` is the default
 //!   compression algorithm `mkdwarfs` uses and it should be enough for most cases.
 //!
+//! - `ruzstd` *(Disabled by default)*
+//!
+//!   Decompress Zstd with the pure-Rust [`ruzstd`][ruzstd] decoder instead of
+//!   the C library behind `zstd`, for builds that cannot compile or link C
+//!   code. It is slower. If both features are enabled, `zstd` is used.
+//!
+//!   [ruzstd]: https://crates.io/crates/ruzstd
+//!
 //! - `log` *(Enabled by default)*
 //!
 //!   Enable trace-level logging and time measurement for internal events via

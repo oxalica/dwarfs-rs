@@ -641,6 +641,10 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
                 ErrorInner::Decompress(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
                     .into()
             }),
+            #[cfg(all(feature = "ruzstd", not(feature = "zstd")))]
+            CompressAlgo::ZSTD => {
+                ruzstd_decompress(out, raw_buf).map_err(|err| ErrorInner::Decompress(err).into())
+            }
             #[cfg(feature = "lzma")]
             #[expect(
                 clippy::cast_possible_truncation,
@@ -856,5 +860,84 @@ impl<R: ReadAt + ?Sized> SectionReader<R> {
         }
 
         Ok(Some((header, entries)))
+    }
+}
+
+/// Decompress all Zstd frames in `src` into `out` with the pure-Rust `ruzstd`
+/// decoder, with the same contract as `zstd_safe::decompress`: the whole
+/// input must be consumed, and output larger than `out` is an error.
+#[cfg(any(test, all(feature = "ruzstd", not(feature = "zstd"))))]
+fn ruzstd_decompress(out: &mut [u8], mut src: &[u8]) -> std::io::Result<usize> {
+    use std::io::{Error, ErrorKind, Read};
+
+    let invalid = |msg: String| Error::new(ErrorKind::InvalidData, msg);
+    let mut len = 0;
+    while !src.is_empty() {
+        let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut src)
+            .map_err(|err| invalid(err.to_string()))?;
+        loop {
+            let n = decoder.read(&mut out[len..])?;
+            if n == 0 {
+                break;
+            }
+            len += n;
+            if len == out.len() {
+                // Full: anything more is over the size limit.
+                if decoder.read(&mut [0u8])? != 0 {
+                    return Err(invalid("decompressed size exceeds the limit".into()));
+                }
+                break;
+            }
+        }
+    }
+    Ok(len)
+}
+
+#[cfg(test)]
+mod ruzstd_tests {
+    use super::ruzstd_decompress;
+    use ruzstd::encoding::{CompressionLevel, compress_to_vec};
+
+    fn frame(data: &[u8]) -> Vec<u8> {
+        compress_to_vec(data, CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn round_trip() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut out = vec![0; data.len()];
+        assert_eq!(
+            ruzstd_decompress(&mut out, &frame(&data)).unwrap(),
+            data.len()
+        );
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn several_frames() {
+        let src = [frame(b"hello, "), frame(b"world")].concat();
+        let mut out = vec![0; 64];
+        let n = ruzstd_decompress(&mut out, &src).unwrap();
+        assert_eq!(&out[..n], b"hello, world");
+    }
+
+    #[test]
+    fn output_over_the_limit_is_an_error() {
+        let src = frame(&[7; 1000]);
+        let mut out = vec![0; 999];
+        assert!(ruzstd_decompress(&mut out, &src).is_err());
+        let mut out = vec![0; 1000];
+        assert_eq!(ruzstd_decompress(&mut out, &src).unwrap(), 1000);
+    }
+
+    #[test]
+    fn garbage_is_an_error() {
+        let mut out = vec![0; 64];
+        assert!(ruzstd_decompress(&mut out, b"not zstd").is_err());
+        let mut src = frame(b"data");
+        src.extend_from_slice(b"trailing");
+        assert!(ruzstd_decompress(&mut out, &src).is_err());
+        let src = frame(b"some data to truncate");
+        assert!(ruzstd_decompress(&mut out, &src[..src.len() - 3]).is_err());
     }
 }
